@@ -1,0 +1,21 @@
+# Disposable integration database. Never points at the production volume.
+services:
+  db-test:
+    image: mariadb:11.4
+    environment:
+      MARIADB_DATABASE: discussion_test
+      MARIADB_USER: test
+      MARIADB_PASSWORD: test_only_password
+      MARIADB_ROOT_PASSWORD: test_only_root_password
+    ports:
+      - "127.0.0.1:33316:3306"
+    volumes:
+      - test_data:/var/lib/mysql
+    healthcheck:
+      test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+volumes:
+  test_data:
+

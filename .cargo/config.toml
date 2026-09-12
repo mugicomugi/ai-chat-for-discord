@@ -1,0 +1,3 @@
+[build]
+# serenity is a large crate; keep builds practical on Docker Desktop.
+jobs = 1

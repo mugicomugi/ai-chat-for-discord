@@ -1,0 +1,56 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?Set DISCORD_TOKEN in .env}
+      GRANT_ROLE_ID: ${GRANT_ROLE_ID:?Set GRANT_ROLE_ID in .env}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:?Set OLLAMA_API_KEY in .env}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:120b}
+      DB_HOST: db
+      DB_PORT: 3306
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-discussion}
+      MARIADB_USER: ${MARIADB_USER:-discussion}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:?Set MARIADB_PASSWORD in .env}
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-180}
+      RUST_LOG: ${RUST_LOG:-discord_discussion_bot=info}
+    depends_on:
+      db:
+        condition: service_healthy
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  db:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-discussion}
+      MARIADB_USER: ${MARIADB_USER:-discussion}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:?Set MARIADB_PASSWORD in .env}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?Set MARIADB_ROOT_PASSWORD in .env}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  mariadb_data:
