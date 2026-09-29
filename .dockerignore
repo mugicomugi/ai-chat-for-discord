@@ -5,3 +5,5 @@ target
 backups
 *.log
 
+compose.override.yaml
+beszel_agent_data
