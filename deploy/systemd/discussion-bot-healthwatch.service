@@ -1,0 +1,11 @@
+[Unit]
+Description=Discussion bot host health checks
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# OPS_WEBHOOK_URL, DOMAIN (root-only file, mode 600)
+EnvironmentFile=/etc/discussion-bot/ops.env
+WorkingDirectory=/home/ubuntu/ai-chat-for-discord
+ExecStart=/home/ubuntu/ai-chat-for-discord/scripts/healthwatch.sh

@@ -1,6 +1,8 @@
 # Discord AI Discussion Bot
 
-Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネルの過去の投稿を文脈としてOllama Cloudの `gpt-oss:120b` に渡します。BotとMariaDBをDocker Composeで起動できます。GPU・ローカルOllamaは不要です。
+Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネルの過去の投稿を文脈としてOllama Cloudの `gpt-oss:120b` に渡します。BotとMariaDB 12.3をDocker Composeで起動できます。GPU・ローカルOllamaは不要です。
+
+本番（Oracle Cloud の 1GB VM）の構築・デプロイ・バックアップ・監視は [docs/runbook.md](docs/runbook.md) を参照してください。本番ではイメージをビルドせず、GitHub Actions がビルドして GHCR に置いたイメージを digest 指定で使います。
 
 ## 使い方
 
@@ -26,7 +28,7 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 
 1. [Discord Developer Portal](https://discord.com/developers/applications) でアプリを作成し、Botトークンを取得します。
 2. **Bot → Privileged Gateway Intents → Message Content Intent** を有効にします。Server Members Intentは不要です。大規模な導入でIntentの審査が必要になった場合はDiscordの案内に従ってください。
-3. **Installation / OAuth2 URL Generator** でサーバーへのインストールを選び、`bot` と `applications.commands` のスコープを設定します。このURLから複数のサーバーへ個別にインストールできます。
+3. **Installation / OAuth2 URL Generator** でサーバーへのインストールを選び、`bot` と `applications.commands` のスコープを設定します。本番では Install Link を None にして **Public Bot を OFF** にし、運営者が許可したサーバーにだけ追加します（手順は [docs/runbook.md](docs/runbook.md) の「サーバーを追加する」）。
 4. Botに `View Channels`、`Read Message History`、`Send Messages`、`Send Messages in Threads` の権限を付けて招待します。Administratorは不要です。プライベートスレッドではBotもメンバーとして参加させます。
 5. 利用者を制限したいサーバーでは、サーバー設定の連携サービス（Integrations）で `/talk` を使えるロール・ユーザーを設定します。サーバーごとに独立した設定です。
 
@@ -43,6 +45,7 @@ Copy-Item .env.example .env
 以下を編集します。秘密情報に `$` や `#` が含まれる場合は値をシングルクォートで囲んでください。
 
 ```dotenv
+BOT_IMAGE=ghcr.io/mugicomugi/ai-chat-for-discord@sha256:replace_with_digest_from_ci
 DISCORD_TOKEN=your_discord_bot_token
 OLLAMA_API_KEY=your_ollama_api_key
 OLLAMA_MODEL=gpt-oss:120b
@@ -52,6 +55,7 @@ MARIADB_PASSWORD=your_long_random_password
 MARIADB_ROOT_PASSWORD=your_different_long_random_root_password
 ```
 
+- `BOT_IMAGE` は GitHub Actions（`ci` ワークフロー）の実行結果の Summary に表示される digest 付きのイメージです。本番では `scripts/deploy.sh` が書き換えます。手元でビルドする場合は `discord-discussion-bot:local` など任意の名前にします。
 - Ollamaキーは [Ollamaの設定](https://ollama.com/settings/keys) で発行します。推論と検索で同じキーを使用します。
 - `/talk` はグローバルコマンドとして登録され、Botをインストールした全サーバーで利用できます。登録直後は反映まで最大1時間ほどかかる場合があります。会話履歴・DBの記録はサーバー（ギルド）ごとに分離されます。
 - `RETENTION_DAYS=30`：DBの保持期間（1〜3650日）。起動時と1時間ごとに期限切れを削除します。
@@ -62,15 +66,16 @@ MARIADB_ROOT_PASSWORD=your_different_long_random_root_password
 
 ### 3. 起動
 
-Docker DesktopをLinuxコンテナモードで起動し、プロジェクトのフォルダで実行します。
+本番の VM では [docs/runbook.md](docs/runbook.md) の手順で `scripts/deploy.sh` を使います。手元（Docker Desktop を Linux コンテナモードで起動）で試す場合は、`compose.build.yaml` を重ねてローカルでビルドします。
 
 ```powershell
-docker compose up -d --build
+$env:BOT_IMAGE = 'discord-discussion-bot:local'
+docker compose -f compose.yaml -f compose.build.yaml up -d --build
 docker compose ps
 docker compose logs --tail 100 bot
 ```
 
-ログに `database_ready` と `discord_ready` が出たら、指定ロールを持つユーザーから `/talk` を実行します。MariaDBはヘルスチェック完了後にBotへ接続され、スキーマは自動作成されます。DBポートはホストへ公開しません。Botは非root・読み取り専用ファイルシステムで起動します。
+ログに `database_ready` と `discord_ready` が出たら `/talk` を実行します。MariaDBはヘルスチェック完了後にBotへ接続され、スキーマは自動作成されます。DBは外部に出られない内部ネットワークに置き、ポートはホストへ公開しません。Botは非root・読み取り専用ファイルシステムで、メモリ上限（256MB）付きで起動します。
 
 停止・再起動:
 
@@ -98,7 +103,7 @@ docker compose up -d
 
 ## 開発とテスト
 
-Rust 1.98以上を使用します。依存関係は `Cargo.lock` で固定しています。
+Rust 1.98以上を使用します。依存関係は `Cargo.lock` で固定しています。GitHub Actions（`.github/workflows/ci.yml`）が push と pull request のたびに整形・Clippy・テスト・実DBテスト（MariaDB 12.3.3）を実行し、main へのマージ時にイメージを GHCR へ push します。
 
 ```powershell
 cargo fmt --check
@@ -151,14 +156,16 @@ cargo test --locked --test live_ollama -- --ignored
 
 ## 更新・バックアップ
 
-更新前にDBをバックアップし、コード更新後に再ビルドします。SQLマイグレーションは前方向に適用するため、古いアプリへ戻す場合は対応するDBバックアップも使ってください。
+本番の VM では、毎日の暗号化バックアップ（`scripts/backup.sh`、systemd タイマー）とデプロイ前のバックアップが自動で取られます。更新・切り戻し・復元の手順は [docs/runbook.md](docs/runbook.md) を参照してください。SQLマイグレーションは追加だけの前方向で、古いイメージも新しいスキーマで起動できます。
+
+手元の環境では、次のコマンドでバックアップを取れます（`--hex-blob` はバイナリ列を安全に出力するためのものです）。
 
 ```powershell
 New-Item -ItemType Directory -Force backups
-docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb-dump -uroot --single-transaction "$MARIADB_DATABASE" > /tmp/discussion.sql'
+docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb-dump -uroot --single-transaction --hex-blob "$MARIADB_DATABASE" > /tmp/discussion.sql'
 docker compose cp db:/tmp/discussion.sql ./backups/discussion.sql
 docker compose exec db rm /tmp/discussion.sql
-docker compose up -d --build
+docker compose -f compose.yaml -f compose.build.yaml up -d --build
 ```
 
 復元はBotを停止し、復元先のDBを確認してから実施します。次の操作は現在のDB内容をバックアップ時点へ戻します。

@@ -1,0 +1,13 @@
+[Unit]
+Description=Encrypted backup of the discussion bot database
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# BACKUP_AGE_RECIPIENT, BACKUP_REMOTE_CMD, BACKUP_PING_URL (root-only file, mode 600)
+EnvironmentFile=/etc/discussion-bot/ops.env
+WorkingDirectory=/home/ubuntu/ai-chat-for-discord
+ExecStart=/home/ubuntu/ai-chat-for-discord/scripts/backup.sh daily
+Nice=10
+IOSchedulingClass=idle

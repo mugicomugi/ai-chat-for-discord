@@ -1,0 +1,13 @@
+[Unit]
+Description=Block container access to OCI link-local services except DNS
+Requires=docker.service
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/ubuntu/ai-chat-for-discord/scripts/imds-block.sh
+
+[Install]
+WantedBy=docker.service
