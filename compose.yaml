@@ -1,8 +1,9 @@
 services:
   bot:
-    # Built by GitHub Actions and pulled by digest (scripts/deploy.sh). The production VM never
-    # builds images; compose.build.yaml is for development machines only.
-    image: ${BOT_IMAGE:?Set BOT_IMAGE to ghcr.io/mugicomugi/ai-chat-for-discord@sha256:... in .env}
+    # An immutable image set by scripts/deploy.sh: discord-discussion-bot:git-<commit> built on
+    # the VM by scripts/build-image.sh, or a CI image pinned by digest. compose.build.yaml
+    # (compile inside Docker) is for development machines only.
+    image: ${BOT_IMAGE:?Set BOT_IMAGE in .env (see docs/runbook.md)}
     pull_policy: missing
     restart: unless-stopped
     init: true

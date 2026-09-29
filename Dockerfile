@@ -19,11 +19,19 @@ RUN rustup component add clippy rustfmt
 RUN cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
 ENTRYPOINT ["cargo", "test", "--locked"]
 
-FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime-base
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --no-create-home bot
 WORKDIR /app
-COPY --from=build /app/bot /app/bot
 USER 10001:10001
 ENTRYPOINT ["/app/bot"]
+
+# Image with a binary compiled on the production VM by scripts/build-image.sh, which passes it
+# as the named build context "prebuilt" (target/ is excluded from the main context).
+FROM runtime-base AS runtime-prebuilt
+COPY --from=prebuilt discord-discussion-bot /app/bot
+
+# Default target: compile inside Docker (development machines and CI).
+FROM runtime-base AS runtime
+COPY --from=build /app/bot /app/bot

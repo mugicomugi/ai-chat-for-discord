@@ -1,6 +1,9 @@
 # 運用手順書（本番 VM）
 
-本番は Oracle Cloud の VM.Standard.E2.1.Micro（実効 1/8 OCPU・1GB RAM）で動かします。この VM では Docker イメージをビルドしません。GitHub Actions がビルドして GHCR に push したイメージを、digest を指定して pull します。
+本番は Oracle Cloud の VM.Standard.E2.1.Micro（実効 1/8 OCPU・1GB RAM）で動かします。Bot のイメージはこの VM でビルドします。
+
+- `scripts/cargo-vm.sh` と `scripts/build-image.sh` は、cargo をメモリ上限（既定 400MB を超えると抑制、550MB で上限）と最低の CPU・I/O 優先度で動かします。ビルドは遅い（初回は 1 時間以上）ので、利用の少ない時間に実行してください。
+- イメージのタグは `discord-discussion-bot:git-<コミット>` です。GitHub Actions が使える場合は、CI が GHCR に push したイメージ（`…@sha256:…`）も同じ手順でデプロイできます。
 
 - リポジトリの場所: `/home/ubuntu/ai-chat-for-discord`（以下のコマンドはこのディレクトリで実行）
 - `docker` の実行には `sudo` が必要です。
@@ -48,11 +51,14 @@
    - `OPS_WEBHOOK_URL` には、運営者専用の Discord サーバーのチャンネル Webhook を指定します。
    - `BACKUP_REMOTE_CMD` を設定すると、バックアップを VM の外（OCI Object Storage など）へもコピーします。保管先は 35 日で自動削除する設定にします。
 
-6. リポジトリを CI でビルドしたコミットに合わせ、`.env` に `BOT_IMAGE` を書く。値は、GitHub Actions の `ci` ワークフローの Summary に出る `ghcr.io/…@sha256:…` です。
+6. ビルドに必要なものを入れ、リポジトリを更新してイメージをビルドし、`.env` に `BOT_IMAGE` を書く。
 
    ```bash
+   sudo apt-get install -y --no-install-recommends gcc libc6-dev
+   curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.98 -c rustfmt,clippy
    git pull --ff-only
-   nano .env        # BOT_IMAGE=ghcr.io/mugicomugi/ai-chat-for-discord@sha256:... を追加
+   scripts/build-image.sh            # 最後に表示されるタグを控える
+   nano .env                         # BOT_IMAGE=discord-discussion-bot:git-<コミット> を追加
    ```
 
 7. systemd のユニットを入れて有効にする。
@@ -78,38 +84,45 @@
    - iscsid と multipathd もブートボリュームに必要です。
    - Oracle Cloud Agent のプラグインのうち不要なもの（Run Command など）は、OCI コンソールのインスタンス詳細画面「Oracle Cloud Agent」タブで無効にします。
 
-9. GHCR のパッケージを公開にする（リポジトリは公開済みで、イメージに秘密情報は含まれません）。
+9. （GitHub Actions を使う場合だけ）GHCR のパッケージを公開にする。リポジトリは公開済みで、イメージに秘密情報は含まれません。
    - 手順: GitHub の Packages → `ai-chat-for-discord` → Package settings → Change visibility → Public。
-   - 非公開のままにする場合は、`read:packages` 権限だけの classic PAT（期限 90 日）を作り、`sudo docker login ghcr.io -u mugicomugi --password-stdin` でログインします。PAT の期限が切れる前に更新してください。
+   - 非公開のままにする場合は、`read:packages` 権限だけの classic PAT（期限 90 日）を作り、`sudo docker login ghcr.io -u mugicomugi --password-stdin` でログインします。
 
 ## 2. デプロイと切り戻し
 
 > **M0 の初回（DB がまだ 11.4 のとき）は、この手順ではなく「3. MariaDB 11.4 → 12.3.3 への更新」を行います。**
 
-1. GitHub Actions の `ci` ワークフロー（main への push 後）の Summary から、コミットとコマンドを控える。
-2. VM のリポジトリをそのコミットに合わせる（compose.yaml やスクリプトがイメージと一致するように）。
+1. VM のリポジトリをデプロイするコミットに合わせる（compose.yaml やスクリプトがイメージと一致するように）。
 
    ```bash
    git pull --ff-only          # または git checkout <commit>
    ```
 
-3. 実行する。
+2. テストしてからイメージをビルドする（どちらも時間がかかるので、利用の少ない時間に）。
 
    ```bash
-   sudo scripts/deploy.sh ghcr.io/mugicomugi/ai-chat-for-discord@sha256:<digest>
+   scripts/cargo-vm.sh clippy --locked --all-targets -- -D warnings
+   scripts/cargo-vm.sh test --locked
+   scripts/build-image.sh      # 最後に discord-discussion-bot:git-<コミット> が表示される
+   ```
+
+3. デプロイする。
+
+   ```bash
+   sudo scripts/deploy.sh discord-discussion-bot:git-<コミット>
    ```
 
    `deploy.sh` は次の順に処理します。
    1. 暗号化したバックアップを取る（`backups/pre-deploy`）。
-   2. イメージを pull する。
+   2. イメージがあることを確認する（CI のイメージなら pull する）。
    3. `.env` の `BOT_IMAGE` を書き換える。
    4. **Bot だけ**を再起動する（DB は作り直しません）。
    5. `database_ready` と `discord_ready` がログに出るまで待つ。
    6. 古いイメージを整理する（直近 3 つは残す）。
 
-4. **切り戻し**: `sudo tail backups/deploy-history.log` の `previous=` の値を指定して、同じコマンドを実行します。マイグレーションは追加だけなので、古いイメージも新しいスキーマで起動できます。
+4. **切り戻し**: `sudo tail backups/deploy-history.log` の `previous=` の値を指定して、同じコマンドを実行します。マイグレーションは追加だけなので、古いイメージも新しいスキーマで起動できます。直近 3 つのイメージを残しています。
 
-**M0 以前のイメージ（手元でビルドしていた頃のもの）に戻す場合**、そのイメージには digest がないので、次のように戻します。
+**M0 以前のイメージ（`docker compose up --build` でビルドしていた頃のもの）に戻す場合**は、`deploy.sh` が受け付けないタグなので、次のように戻します。
 
 ```bash
 sudo docker image ls          # 以前のイメージ名（例: ai-chat-for-discord-bot:latest）を確認
@@ -202,7 +215,7 @@ sudo docker compose up -d --no-build --no-deps bot
 3. `migrations/` の該当ファイルは DDL を 1 文しか含みません。対象の表や列がすでにできているかを確認します。
    - できていなければ、失敗した行を削除する（`DELETE FROM _sqlx_migrations WHERE version = N AND success = 0`）。
    - できていれば、その DDL を手作業で取り消してから行を削除する。
-4. 原因を直したイメージをデプロイするか、直前の digest に切り戻す。判断がつかないときは `backups/pre-deploy` の最新のものから復元します（「5. バックアップと復元」）。
+4. 原因を直したイメージをデプロイするか、直前のイメージに切り戻す。判断がつかないときは `backups/pre-deploy` の最新のものから復元します（「5. バックアップと復元」）。
 
 ## 5. バックアップと復元
 

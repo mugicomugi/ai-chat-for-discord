@@ -2,7 +2,7 @@
 
 Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネルの過去の投稿を文脈としてOllama Cloudの `gpt-oss:120b` に渡します。BotとMariaDB 12.3をDocker Composeで起動できます。GPU・ローカルOllamaは不要です。
 
-本番（Oracle Cloud の 1GB VM）の構築・デプロイ・バックアップ・監視は [docs/runbook.md](docs/runbook.md) を参照してください。本番ではイメージをビルドせず、GitHub Actions がビルドして GHCR に置いたイメージを digest 指定で使います。
+本番（Oracle Cloud の 1GB VM）の構築・デプロイ・バックアップ・監視は [docs/runbook.md](docs/runbook.md) を参照してください。本番のイメージは VM 上で `scripts/build-image.sh` によりビルドします（メモリ上限と低い優先度で動かし、稼働中の Bot と DB への影響を抑えます）。
 
 ## 使い方
 
@@ -45,7 +45,7 @@ Copy-Item .env.example .env
 以下を編集します。秘密情報に `$` や `#` が含まれる場合は値をシングルクォートで囲んでください。
 
 ```dotenv
-BOT_IMAGE=ghcr.io/mugicomugi/ai-chat-for-discord@sha256:replace_with_digest_from_ci
+BOT_IMAGE=discord-discussion-bot:git-replace_with_commit
 DISCORD_TOKEN=your_discord_bot_token
 OLLAMA_API_KEY=your_ollama_api_key
 OLLAMA_MODEL=gpt-oss:120b
@@ -55,7 +55,7 @@ MARIADB_PASSWORD=your_long_random_password
 MARIADB_ROOT_PASSWORD=your_different_long_random_root_password
 ```
 
-- `BOT_IMAGE` は GitHub Actions（`ci` ワークフロー）の実行結果の Summary に表示される digest 付きのイメージです。本番では `scripts/deploy.sh` が書き換えます。手元でビルドする場合は `discord-discussion-bot:local` など任意の名前にします。
+- `BOT_IMAGE` は起動するイメージです。本番では `scripts/build-image.sh` が表示するタグ（`discord-discussion-bot:git-<コミット>`）を `scripts/deploy.sh` に渡すと書き換わります。手元でビルドする場合は `discord-discussion-bot:local` など任意の名前にします。
 - Ollamaキーは [Ollamaの設定](https://ollama.com/settings/keys) で発行します。推論と検索で同じキーを使用します。
 - `/talk` はグローバルコマンドとして登録され、Botをインストールした全サーバーで利用できます。登録直後は反映まで最大1時間ほどかかる場合があります。会話履歴・DBの記録はサーバー（ギルド）ごとに分離されます。
 - `RETENTION_DAYS=30`：DBの保持期間（1〜3650日）。起動時と1時間ごとに期限切れを削除します。
@@ -103,7 +103,7 @@ docker compose up -d
 
 ## 開発とテスト
 
-Rust 1.98以上を使用します。依存関係は `Cargo.lock` で固定しています。GitHub Actions（`.github/workflows/ci.yml`）が push と pull request のたびに整形・Clippy・テスト・実DBテスト（MariaDB 12.3.3）を実行し、main へのマージ時にイメージを GHCR へ push します。
+Rust 1.98以上を使用します。依存関係は `Cargo.lock` で固定しています。本番の VM でテストするときは、`scripts/cargo-vm.sh`（メモリ上限と低い優先度で cargo を実行）を使います。例: `scripts/cargo-vm.sh clippy --locked --all-targets -- -D warnings`。GitHub Actions の設定（`.github/workflows/ci.yml`）もあり、Actions が使える状態なら push と pull request のたびに同じ検査を実行します。
 
 ```powershell
 cargo fmt --check
