@@ -27,5 +27,11 @@ strip = true
 opt-level = 1
 codegen-units = 16
 
+# Optimising serenity needs about 900 MB, which the 1 GB production VM (which builds the image)
+# cannot provide next to the live bot and database. Its work is I/O-bound, so it is built
+# unoptimised; every other crate keeps opt-level 1.
+[profile.release.package.serenity]
+opt-level = 0
+
 [profile.dev]
 debug = 0
