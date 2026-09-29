@@ -18,18 +18,17 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 
 オプションは毎回独立しています。前の呼び出しの設定は引き継ぎません。通常のテキストチャンネル・既存スレッド・フォーラム投稿内で利用できます。回答は公開されます。DM、画像・添付ファイル解析、メンションによる呼び出しは実装していません。
 
-**利用ロール:** `.env` の必須項目 `GRANT_ROLE_ID` に指定したロールを持つユーザーだけが利用できます。指定ロールがなければ、BotはInteractionに一切応答せず、Discordが「アプリケーションの応答がありません」（クライアント言語等によって表記が異なる場合あり）を表示します。管理者も例外ではありません。未許可の呼び出しでは履歴取得・DB保存・AI呼び出しを行いません。サーバーの通常投稿は、発言者の利用ロールの有無にかかわらず履歴の参照対象です。
+**利用制御:** Bot自体はロールによる利用制限を行いません。誰が `/talk` を使えるかは、サーバーごとにDiscordのサーバー設定内の連携サービス（Integrations）のコマンド権限で制御してください。設定はサーバー単位で完結し、Bot側の再起動や設定変更は不要です。未設定の場合、既定でそのサーバーの全員が利用できます。利用を制限した相手が呼び出すと、Discordが「アプリケーションの応答がありません」（クライアント言語等によって表記が異なる場合あり）を表示します。サーバーの通常投稿は、発言者に関わらず履歴の参照対象です。
 
 ## セットアップ
 
-### 1. Discordアプリとロール
+### 1. Discordアプリ
 
 1. [Discord Developer Portal](https://discord.com/developers/applications) でアプリを作成し、Botトークンを取得します。
 2. **Bot → Privileged Gateway Intents → Message Content Intent** を有効にします。Server Members Intentは不要です。大規模な導入でIntentの審査が必要になった場合はDiscordの案内に従ってください。
-3. **Installation / OAuth2 URL Generator** でサーバーへのインストールを選び、`bot` と `applications.commands` のスコープを設定します。
+3. **Installation / OAuth2 URL Generator** でサーバーへのインストールを選び、`bot` と `applications.commands` のスコープを設定します。このURLから複数のサーバーへ個別にインストールできます。
 4. Botに `View Channels`、`Read Message History`、`Send Messages`、`Send Messages in Threads` の権限を付けて招待します。Administratorは不要です。プライベートスレッドではBotもメンバーとして参加させます。
-5. サーバーに利用許可用ロールを作成して利用者へ付けます。Discordのユーザー設定で開発者モードを有効化し、そのロールを右クリックしてIDをコピーします。
-6. サーバー設定の連携サービスで `/talk` の利用を許可します。未許可ユーザーにDiscord標準の無応答エラーを表示させたい場合、Discord側ではコマンドを隠さず、Botの `GRANT_ROLE_ID` 判定に任せてください。
+5. 利用者を制限したいサーバーでは、サーバー設定の連携サービス（Integrations）で `/talk` を使えるロール・ユーザーを設定します。サーバーごとに独立した設定です。
 
 履歴参照時はBotと実行者の両方に閲覧・履歴閲覧権限が必要です。Botが読めないチャンネルへ権限を拡大する動作はありません。
 
@@ -45,10 +44,8 @@ Copy-Item .env.example .env
 
 ```dotenv
 DISCORD_TOKEN=your_discord_bot_token
-GRANT_ROLE_ID=123456789012345678
 OLLAMA_API_KEY=your_ollama_api_key
 OLLAMA_MODEL=gpt-oss:120b
-DISCORD_GUILD_ID=your_test_server_id
 MARIADB_DATABASE=discussion
 MARIADB_USER=discussion
 MARIADB_PASSWORD=your_long_random_password
@@ -56,8 +53,7 @@ MARIADB_ROOT_PASSWORD=your_different_long_random_root_password
 ```
 
 - Ollamaキーは [Ollamaの設定](https://ollama.com/settings/keys) で発行します。推論と検索で同じキーを使用します。
-- `GRANT_ROLE_ID` は単一のロールIDです。空・0・非数値では起動に失敗します。ロールIDはサーバー固有なので、初期版は1つのサーバーでの運用を想定しています。
-- `DISCORD_GUILD_ID` を設定するとそのサーバーだけに `/talk` を登録し、テスト時にすぐ利用できます。空ならグローバル登録です。登録範囲を切り替える際は古い範囲の `/talk` をDiscord APIで削除してから切り替えてください。本Botは他コマンドを削除しません。
+- `/talk` はグローバルコマンドとして登録され、Botをインストールした全サーバーで利用できます。登録直後は反映まで最大1時間ほどかかる場合があります。会話履歴・DBの記録はサーバー（ギルド）ごとに分離されます。
 - `RETENTION_DAYS=30`：DBの保持期間（1〜3650日）。起動時と1時間ごとに期限切れを削除します。
 - `REQUEST_TIMEOUT_SECONDS=180`：履歴取得から回答投稿までのタイムアウト（10〜600秒）。個々のOllama HTTPリクエストは最大120秒です。
 - `RUST_LOG=discord_discussion_bot=info`：通常ログ。本文・キー・DBパスワード・内部推論は記録しません。依存ライブラリの詳細ログを有効にする場合は、そこに含まれるデータに注意してください。
@@ -83,7 +79,7 @@ docker compose stop
 docker compose up -d
 ```
 
-設定変更後は `docker compose up -d` で反映します。`GRANT_ROLE_ID` は起動時に読み込み、ユーザーのロール所属は呼び出しごとのInteractionで判定します。
+設定変更後は `docker compose up -d` で反映します。
 
 ## 履歴・検索・保存の仕様
 
@@ -147,7 +143,7 @@ cargo test --locked --test live_ollama -- --ignored
 
 実トークンと利用ロールの設定後、以下をテストサーバーで確認します。
 
-1. 指定ロールありで既定の `/talk` が応答する。指定ロールなしでは無応答エラーとなり、DBにレコードが増えない。
+1. 既定の `/talk` が応答する。サーバー設定の連携サービスで利用を制限したユーザーは無応答エラーとなり、DBにレコードが増えない。
 2. 過去15分内の通常投稿が反映され、`history:2h` では範囲が広がり、`history:0m` では参照されない。
 3. `web_search:true` で検索を明示的に依頼すると出典付きで回答する。省略時・`false` では検索しない。
 4. 別チャンネル・親チャンネルの会話がスレッド内の文脈へ混入しない。

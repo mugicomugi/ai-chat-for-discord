@@ -8,8 +8,6 @@ services:
     security_opt: [no-new-privileges:true]
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN:?Set DISCORD_TOKEN in .env}
-      GRANT_ROLE_ID: ${GRANT_ROLE_ID:?Set GRANT_ROLE_ID in .env}
-      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
       OLLAMA_API_KEY: ${OLLAMA_API_KEY:?Set OLLAMA_API_KEY in .env}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:120b}
       DB_HOST: db

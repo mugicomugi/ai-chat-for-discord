@@ -109,14 +109,9 @@ impl EventHandler for Handler {
         if self.registered.swap(true, Ordering::SeqCst) {
             return;
         }
-        let result = match self.config.guild_id {
-            Some(guild) => {
-                GuildId::new(guild)
-                    .create_command(&ctx.http, talk_command())
-                    .await
-            }
-            None => Command::create_global_command(&ctx.http, talk_command()).await,
-        };
+        // Bulk-overwrite (rather than single create) so this call alone fully reflects the
+        // current definition, even if a prior run registered /talk with different options.
+        let result = Command::set_global_commands(&ctx.http, vec![talk_command()]).await;
         if let Err(error) = result {
             self.registered.store(false, Ordering::SeqCst);
             match error {
@@ -134,9 +129,17 @@ impl EventHandler for Handler {
             }
             // Fail visibly instead of leaving an online bot with no usable command.
             ctx.shard.shutdown_clean();
-        } else {
-            tracing::info!(bot_id = ready.user.id.get(), "discord_ready");
+            return;
         }
+        // A previous run may have left /talk registered as a guild-specific command (from
+        // before this bot only ever registered globally). Clear those out so every joined
+        // guild ends up using the global command instead of a stale per-guild override.
+        for guild in ready.guilds.iter().map(|guild| guild.id) {
+            if guild.set_commands(&ctx.http, vec![]).await.is_err() {
+                tracing::warn!(guild_id = guild.get(), "stale_guild_command_cleanup_failed");
+            }
+        }
+        tracing::info!(bot_id = ready.user.id.get(), "discord_ready");
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -152,11 +155,6 @@ impl EventHandler for Handler {
 
 impl Handler {
     async fn handle(&self, ctx: &Context, command: &CommandInteraction) {
-        // Intentionally do not acknowledge unauthorized interactions. Discord displays
-        // its native "application did not respond" error; no data/API work starts.
-        if !has_granted_role(command.member.as_deref(), self.config.grant_role_id) {
-            return;
-        }
         let Some(guild) = command.guild_id else {
             reject(ctx, command, "このコマンドはサーバー内で利用してください。").await;
             return;
@@ -464,10 +462,6 @@ impl Handler {
     }
 }
 
-fn has_granted_role(member: Option<&Member>, role_id: u64) -> bool {
-    member.is_some_and(|member| member.roles.contains(&RoleId::new(role_id)))
-}
-
 fn timestamp(value: Timestamp) -> DateTime<Utc> {
     DateTime::from_timestamp_millis((value.unix_timestamp_nanos() / 1_000_000) as i64)
         .expect("Discord timestamp is representable")
@@ -500,17 +494,5 @@ mod tests {
         let mentions = serde_json::to_value(no_mentions()).unwrap();
         assert_eq!(mentions["parse"], serde_json::json!([]));
         assert_eq!(mentions["replied_user"], false);
-    }
-
-    #[test]
-    fn role_gate_has_no_admin_bypass() {
-        let mut member = Member::default();
-        member.roles = vec![RoleId::new(123)];
-        member.permissions = Some(Permissions::ADMINISTRATOR);
-        assert!(has_granted_role(Some(&member), 123));
-        assert!(!has_granted_role(Some(&member), 456));
-        assert!(!has_granted_role(None, 123));
-        member.roles.clear();
-        assert!(!has_granted_role(Some(&member), 123));
     }
 }
