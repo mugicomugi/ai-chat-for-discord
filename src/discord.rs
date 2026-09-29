@@ -73,7 +73,9 @@ impl TalkError {
 pub fn talk_command() -> CreateCommand {
     CreateCommand::new("talk")
         .description("チャンネルの会話を踏まえてAIと議論します")
-        .dm_permission(false)
+        // `contexts` supersedes the deprecated `dm_permission`: guild installs, used in guilds only.
+        .contexts(vec![InteractionContext::Guild])
+        .integration_types(vec![InstallationContext::Guild])
         .add_option(
             CreateCommandOption::new(CommandOptionType::String, "message", "質問・議論したい内容")
                 .required(true)
@@ -131,14 +133,9 @@ impl EventHandler for Handler {
             ctx.shard.shutdown_clean();
             return;
         }
-        // A previous run may have left /talk registered as a guild-specific command (from
-        // before this bot only ever registered globally). Clear those out so every joined
-        // guild ends up using the global command instead of a stale per-guild override.
-        for guild in ready.guilds.iter().map(|guild| guild.id) {
-            if guild.set_commands(&ctx.http, vec![]).await.is_err() {
-                tracing::warn!(guild_id = guild.get(), "stale_guild_command_cleanup_failed");
-            }
-        }
+        // Stale guild-scoped commands from older versions are removed once by the operator
+        // (docs/runbook.md) instead of on every start: one REST call per guild per restart
+        // would add up against Discord's invalid-request limit.
         tracing::info!(bot_id = ready.user.id.get(), "discord_ready");
     }
 
@@ -489,7 +486,10 @@ mod tests {
     fn command_contract_and_mentions() {
         let value = serde_json::to_value(talk_command()).unwrap();
         assert_eq!(value["name"], "talk");
-        assert_eq!(value["dm_permission"], false);
+        // Guild context (0) and guild install (0) only; the deprecated field is not sent.
+        assert_eq!(value["contexts"], serde_json::json!([0]));
+        assert_eq!(value["integration_types"], serde_json::json!([0]));
+        assert!(value.get("dm_permission").is_none());
         assert_eq!(value["options"][0]["required"], true);
         let mentions = serde_json::to_value(no_mentions()).unwrap();
         assert_eq!(mentions["parse"], serde_json::json!([]));

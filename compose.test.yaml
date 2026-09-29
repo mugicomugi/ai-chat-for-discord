@@ -1,12 +1,20 @@
 # Disposable integration database. Never points at the production volume.
+# Keep the image and server flags in sync with compose.yaml.
 services:
   db-test:
-    image: mariadb:11.4
+    image: mariadb:12.3.3@sha256:805c8e104bd563d5bfa24fadd3f31cd419ea859cb5277f32b5dbf2db714f9ed1
+    command:
+      - --transaction-isolation=READ-COMMITTED
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --character-set-collations=utf8mb4=utf8mb4_unicode_ci
+      - --skip-name-resolve
     environment:
       MARIADB_DATABASE: discussion_test
       MARIADB_USER: test
       MARIADB_PASSWORD: test_only_password
       MARIADB_ROOT_PASSWORD: test_only_root_password
+      MARIADB_AUTO_UPGRADE: "1"
     ports:
       - "127.0.0.1:33316:3306"
     volumes:
@@ -18,4 +26,3 @@ services:
       retries: 30
 volumes:
   test_data:
-

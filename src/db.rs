@@ -3,6 +3,7 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::{
     ConnectOptions, MySqlPool, Row,
+    migrate::MigrateError,
     mysql::{MySqlConnectOptions, MySqlPoolOptions},
 };
 
@@ -36,16 +37,35 @@ impl Database {
             .charset("utf8mb4")
             .timezone(Some("+00:00".into()))
             .disable_statement_logging();
-        let pool = MySqlPoolOptions::new()
-            .max_connections(8)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect_with(options)
-            .await?;
+        let pool = Self::pool_options().connect_with(options).await?;
         Ok(Self { pool })
     }
 
-    pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
-        sqlx::migrate!("./migrations").run(&self.pool).await
+    /// Pool settings shared by the bot and the database tests.
+    pub fn pool_options() -> MySqlPoolOptions {
+        MySqlPoolOptions::new()
+            .max_connections(8)
+            .acquire_timeout(Duration::from_secs(5))
+            // MariaDB 11.8+ enables innodb_snapshot_isolation, which makes REPEATABLE READ raise
+            // ERROR 1020 on concurrent updates. The server is also started with READ-COMMITTED;
+            // setting it per session keeps the behaviour independent of server flags.
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+    }
+
+    pub async fn migrate(&self) -> Result<(), MigrateError> {
+        let mut migrator = sqlx::migrate!("./migrations");
+        // Rolling back to an older image must still start against a schema that a newer image
+        // migrated. Migrations are therefore additive only, and unknown applied versions are
+        // tolerated instead of failing startup.
+        migrator.set_ignore_missing(true);
+        migrator.run(&self.pool).await
     }
 
     pub async fn recover(&self) -> Result<u64, sqlx::Error> {
@@ -127,5 +147,44 @@ impl Database {
             .bind(if error_code.is_some() { "failed" } else { "completed" }).bind(error_code).bind(id)
             .execute(&self.pool).await?;
         Ok(())
+    }
+}
+
+/// Classifies a migration failure for logs without SQL text or driver messages. A `dirty`
+/// version means a DDL statement failed part-way (MariaDB DDL is not transactional); see the
+/// recovery steps in docs/runbook.md.
+pub fn migrate_error_summary(error: &MigrateError) -> (&'static str, Option<i64>) {
+    match error {
+        MigrateError::Dirty(version) => ("dirty", Some(*version)),
+        MigrateError::ExecuteMigration(_, version) => ("execute_migration", Some(*version)),
+        MigrateError::VersionMissing(version) => ("version_missing", Some(*version)),
+        MigrateError::VersionMismatch(version) => ("version_mismatch", Some(*version)),
+        MigrateError::VersionNotPresent(version) => ("version_not_present", Some(*version)),
+        MigrateError::VersionTooOld(version, _) => ("version_too_old", Some(*version)),
+        MigrateError::VersionTooNew(version, _) => ("version_too_new", Some(*version)),
+        MigrateError::Execute(_) => ("execute", None),
+        MigrateError::Source(_) => ("source", None),
+        _ => ("other", None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_errors_are_summarized_without_messages() {
+        assert_eq!(
+            migrate_error_summary(&MigrateError::Dirty(3)),
+            ("dirty", Some(3))
+        );
+        assert_eq!(
+            migrate_error_summary(&MigrateError::VersionMismatch(2)),
+            ("version_mismatch", Some(2))
+        );
+        assert_eq!(
+            migrate_error_summary(&MigrateError::Source("secret detail".into())),
+            ("source", None)
+        );
     }
 }

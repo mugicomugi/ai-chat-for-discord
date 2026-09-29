@@ -3,10 +3,7 @@ use discord_discussion_bot::{
     agent::{Answer, Source},
     db::{Database, NewRun},
 };
-use sqlx::{
-    ConnectOptions, Row,
-    mysql::{MySqlConnectOptions, MySqlPoolOptions},
-};
+use sqlx::{ConnectOptions, Row, mysql::MySqlConnectOptions};
 
 async fn database() -> Database {
     let url = std::env::var("TEST_DATABASE_URL")
@@ -17,7 +14,8 @@ async fn database() -> Database {
         Some("discussion_test"),
         "never use a production database for these tests"
     );
-    let pool = MySqlPoolOptions::new()
+    // Same pool settings as the bot (session isolation included), smaller.
+    let pool = Database::pool_options()
         .max_connections(3)
         .connect_with(options.disable_statement_logging())
         .await
@@ -31,6 +29,12 @@ async fn database() -> Database {
 #[ignore = "requires compose.test.yaml and TEST_DATABASE_URL"]
 async fn database_lifecycle() {
     let db = database().await;
+    let read_committed: i64 =
+        sqlx::query_scalar("SELECT @@session.transaction_isolation = 'READ-COMMITTED'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(read_committed, 1, "sessions must run at READ COMMITTED");
     // Only the explicitly named disposable test database is ever cleared.
     sqlx::query("DELETE FROM talk_runs")
         .execute(&db.pool)

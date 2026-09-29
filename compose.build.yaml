@@ -1,0 +1,8 @@
+# Development machines only: build the bot image locally instead of pulling it from GHCR.
+# Never use this on the production VM (1 GB RAM); images are built by GitHub Actions there.
+#
+#   BOT_IMAGE=discord-discussion-bot:local docker compose -f compose.yaml -f compose.build.yaml up -d --build
+services:
+  bot:
+    build: .
+    pull_policy: build

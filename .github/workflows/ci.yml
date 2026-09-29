@@ -1,0 +1,126 @@
+name: ci
+
+# Base images are pinned by digest; Dependabot's weekly docker PRs are how they get refreshed.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Overrides the single-job setting in .cargo/config.toml, which exists for small local hosts.
+  CARGO_BUILD_JOBS: 4
+  # Keep in sync with the Dockerfile build image and Cargo.toml rust-version.
+  RUST_TOOLCHAIN: "1.98"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TEST_DATABASE_URL: mysql://test:test_only_password@127.0.0.1:33316/discussion_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Unit and mock-API tests
+        run: cargo test --locked
+      # Same disposable database and server flags as local runs (compose.test.yaml). The two
+      # database tests share state and must run in order with a server restart between them.
+      - name: Start test database
+        run: docker compose -f compose.test.yaml -p discussion-bot-test up -d --wait
+      - name: Database lifecycle test
+        run: cargo test --locked --test database database_lifecycle -- --ignored --exact
+      - name: Restart test database
+        run: |
+          docker compose -f compose.test.yaml -p discussion-bot-test restart db-test
+          docker compose -f compose.test.yaml -p discussion-bot-test up -d --wait
+      - name: Persistence after restart test
+        run: cargo test --locked --test database persistence_after_restart -- --ignored --exact
+
+  # Pull requests (including Dependabot base-image bumps) build the runtime image without pushing.
+  docker-build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build runtime image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            CARGO_BUILD_JOBS=4
+          cache-from: type=gha
+
+  image:
+    needs: test
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            CARGO_BUILD_JOBS=4
+          tags: |
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Deployment reference
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          {
+            echo "### Deploy"
+            echo
+            echo "Check out commit ${GITHUB_SHA} on the VM, then deploy this image:"
+            echo
+            echo '```'
+            echo "sudo scripts/deploy.sh ghcr.io/${REPOSITORY}@${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

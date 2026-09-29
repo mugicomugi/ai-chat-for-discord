@@ -1,11 +1,17 @@
 services:
   bot:
-    build: .
+    # Built by GitHub Actions and pulled by digest (scripts/deploy.sh). The production VM never
+    # builds images; compose.build.yaml is for development machines only.
+    image: ${BOT_IMAGE:?Set BOT_IMAGE to ghcr.io/mugicomugi/ai-chat-for-discord@sha256:... in .env}
+    pull_policy: missing
     restart: unless-stopped
     init: true
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    memswap_limit: 384m
+    pids_limit: 128
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN:?Set DISCORD_TOKEN in .env}
       OLLAMA_API_KEY: ${OLLAMA_API_KEY:?Set OLLAMA_API_KEY in .env}
@@ -21,6 +27,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    networks: [edge, backend]
     stop_grace_period: 20s
     logging:
       driver: json-file
@@ -29,13 +36,36 @@ services:
         max-file: "3"
 
   db:
-    image: mariadb:11.4
+    # Pinned LTS (supported until 2029-06). Upgrading from 11.4 runs mariadb-upgrade once via
+    # MARIADB_AUTO_UPGRADE; see docs/runbook.md before changing this tag.
+    image: mariadb:12.3.3@sha256:805c8e104bd563d5bfa24fadd3f31cd419ea859cb5277f32b5dbf2db714f9ed1
     restart: unless-stopped
+    # Sized for a 1 GB host that also runs the bot and Caddy.
+    command:
+      - --innodb-buffer-pool-size=160M
+      - --innodb-buffer-pool-size-max=160M
+      - --innodb-log-buffer-size=8M
+      - --key-buffer-size=8M
+      - --aria-pagecache-buffer-size=16M
+      - --max-connections=30
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --performance-schema=OFF
+      - --transaction-isolation=READ-COMMITTED
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --character-set-collations=utf8mb4=utf8mb4_unicode_ci
+      - --skip-name-resolve
     environment:
+      MARIADB_AUTO_UPGRADE: "1"
       MARIADB_DATABASE: ${MARIADB_DATABASE:-discussion}
       MARIADB_USER: ${MARIADB_USER:-discussion}
       MARIADB_PASSWORD: ${MARIADB_PASSWORD:?Set MARIADB_PASSWORD in .env}
       MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?Set MARIADB_ROOT_PASSWORD in .env}
+    # Keep the database out of the kernel OOM killer's first picks; the loose limit only stops
+    # a runaway process (a tight cgroup limit would cause crash recovery instead).
+    oom_score_adj: -500
+    mem_limit: 512m
     volumes:
       - mariadb_data:/var/lib/mysql
     healthcheck:
@@ -44,11 +74,19 @@ services:
       timeout: 5s
       retries: 20
       start_period: 20s
+    networks: [backend]
     logging:
       driver: json-file
       options:
         max-size: 10m
         max-file: "3"
+
+networks:
+  # Outbound access for the bot (Discord, Ollama); Caddy joins this network in a later stage.
+  edge: {}
+  # Database traffic only; no route to the internet.
+  backend:
+    internal: true
 
 volumes:
   mariadb_data:

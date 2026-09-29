@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions in .github/workflows current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # Refreshes the digest-pinned base images in the Dockerfile (security fixes).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # The Rust version is bumped by hand together with RUST_TOOLCHAIN in ci.yml and
+      # rust-version in Cargo.toml; only digest refreshes of rust:1.98-trixie come through here.
+      - dependency-name: rust
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

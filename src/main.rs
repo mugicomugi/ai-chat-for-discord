@@ -6,7 +6,11 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use discord_discussion_bot::{
-    agent::Agent, config::Config, db::Database, discord::Handler, limits::Limits,
+    agent::Agent,
+    config::Config,
+    db::{Database, migrate_error_summary},
+    discord::Handler,
+    limits::Limits,
 };
 use serenity::all::{Client, GatewayIntents};
 use tracing_subscriber::EnvFilter;
@@ -24,9 +28,11 @@ async fn main() -> Result<()> {
     let db = Database::connect(&config).await.map_err(|_| {
         anyhow::anyhow!("database connection failed; check MariaDB and environment settings")
     })?;
-    db.migrate()
-        .await
-        .map_err(|_| anyhow::anyhow!("database migration failed"))?;
+    db.migrate().await.map_err(|error| {
+        let (kind, version) = migrate_error_summary(&error);
+        tracing::error!(kind, version, "database_migration_failed");
+        anyhow::anyhow!("database migration failed")
+    })?;
     let recovered = db
         .recover()
         .await
