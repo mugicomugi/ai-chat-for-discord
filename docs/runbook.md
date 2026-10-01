@@ -508,7 +508,7 @@ scripts/cargo-vm.sh test --locked --test live_embed live_ollama_embed -- --ignor
 
 | 実行日 | モデル | 結果 |
 | --- | --- | --- |
-| （未実行） | | |
+| 2026-10-02（JST、検証用 LXC） | `embeddinggemma` | 利用不可。`live_ollama_embed` は文書・質問とも `embedding_auth` で失敗。追加の直接確認でも `/api/embed` が HTTP 401 を返した。同じキーの `live_chat_and_search` は成功。Cloud の `/api/tags` に当該モデル・埋め込みモデルはなく、今回の環境では Gemini（主）と OpenAI（予備）を使う。 |
 
 使えない場合は Gemini（主）と OpenAI（予備）を使います（`EMBEDDING_PROVIDERS=gemini,openai`）。
 
