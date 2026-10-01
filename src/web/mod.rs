@@ -1,11 +1,13 @@
-//! The web UI: Discord login, the server list, role settings and the knowledge base. It runs in
-//! the bot's process and shares its database pool, Discord REST client (and rate limits),
-//! generation limits and knowledge base.
+//! The web UI: Discord login, the server list, role settings, the knowledge base and the chat.
+//! It runs in the bot's process and shares its database pool, Discord REST client (and rate
+//! limits), generation limits and knowledge base.
 
 pub mod admin;
 pub mod assets;
 pub mod auth;
 pub mod authz;
+pub mod chat;
+pub mod chat_store;
 pub mod kb;
 pub mod security;
 
@@ -63,9 +65,9 @@ pub struct Shared {
 pub struct Web {
     pub config: WebConfig,
     pub db: Database,
-    /// For the web chat (M4).
+    /// For the web chat.
     pub agent: Agent,
-    /// Shared with /talk (M4 uses `Key::User`).
+    /// Shared with /talk; the chat uses `Key::User`.
     pub limits: Arc<Limits>,
     pub bot_guilds: BotGuilds,
     pub discord_ready: Arc<AtomicBool>,
@@ -75,6 +77,8 @@ pub struct Web {
     pub pages: assets::Pages,
     /// `None` when the knowledge base is disabled; its pages then answer 404.
     pub knowledge: Option<Arc<Knowledge>>,
+    /// Answers being generated and recent questions (in memory).
+    pub chat: chat::Chat,
 }
 
 pub type AppState = Arc<Web>;
@@ -93,6 +97,7 @@ impl Web {
             limits: shared.limits,
             bot_guilds: shared.bot_guilds,
             discord_ready: shared.discord_ready,
+            chat: chat::Chat::default(),
         }))
     }
 
@@ -105,7 +110,8 @@ impl Web {
 }
 
 pub fn router(state: AppState) -> Router {
-    // The upload route takes a whole file as its body; every other route small JSON documents.
+    // The upload route takes a whole file as its body, chat messages up to 64 KiB, every other
+    // route small JSON documents.
     // Caddy's request_body limit uses the same KB_MAX_UPLOAD_BYTES (deploy/caddy/Caddyfile).
     let upload_limit = state
         .knowledge
@@ -140,6 +146,16 @@ pub fn router(state: AppState) -> Router {
             "/api/guilds/{guild}/kb/documents/{id}/retry",
             post(kb::retry),
         )
+        .route("/api/conversations", get(chat::list).post(chat::start))
+        .route(
+            "/api/conversations/{id}",
+            get(chat::show).patch(chat::rename).delete(chat::remove),
+        )
+        .route(
+            "/api/conversations/{id}/messages",
+            post(chat::send).layer(DefaultBodyLimit::max(chat::MAX_MESSAGE_BODY_BYTES)),
+        )
+        .route("/api/chat/stop", post(chat::stop))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
@@ -152,14 +168,17 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Serves until `stop` becomes true, then lets open requests finish (the caller bounds the wait).
+/// Chat answers being streamed end then, saving what they have, so their responses finish too.
 pub async fn serve(
     listener: TcpListener,
     state: AppState,
     mut stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    let chat = state.clone();
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
             let _ = stop.wait_for(|stop| *stop).await;
+            chat.chat.shut_down();
         })
         .await
 }

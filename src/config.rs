@@ -20,7 +20,7 @@ pub struct Config {
     pub kb: Option<KbConfig>,
 }
 
-/// Settings of the web UI (Discord login and the settings pages).
+/// Settings of the web UI (Discord login, the settings pages and the chat).
 #[derive(Clone)]
 pub struct WebConfig {
     pub client_id: String,
@@ -30,9 +30,16 @@ pub struct WebConfig {
     pub bind: SocketAddr,
     /// Base of Discord's REST API for the OAuth2 calls (replaced by a mock in tests).
     pub discord_api: String,
+    /// Chat messages one user may send in 24 hours (WEB_DAILY_MESSAGES_PER_USER).
+    pub daily_messages: u32,
+    /// How long one chat answer may take: REQUEST_TIMEOUT_SECONDS, which `Config::from_env`
+    /// sets (the default otherwise).
+    pub request_timeout: Duration,
 }
 
 pub const DEFAULT_WEB_BIND: &str = "0.0.0.0:8080";
+pub const DEFAULT_DAILY_MESSAGES: u32 = 100;
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const DISCORD_API: &str = "https://discord.com/api/v10";
 
 impl WebConfig {
@@ -53,6 +60,7 @@ impl WebConfig {
             var("DISCORD_CLIENT_SECRET"),
             var("PUBLIC_BASE_URL"),
             var("WEB_BIND"),
+            var("WEB_DAILY_MESSAGES_PER_USER"),
         )
     }
 
@@ -62,6 +70,7 @@ impl WebConfig {
         client_secret: Option<String>,
         public_base_url: Option<String>,
         bind: Option<String>,
+        daily_messages: Option<String>,
     ) -> Result<Option<Self>> {
         let set = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
         let (client_id, client_secret, public_base_url) =
@@ -88,12 +97,21 @@ impl WebConfig {
             .trim()
             .parse()
             .map_err(|_| anyhow::anyhow!("WEB_BIND must be an address such as 0.0.0.0:8080"))?;
+        let daily_messages = ranged(
+            &|_: &str| set(daily_messages.clone()),
+            "WEB_DAILY_MESSAGES_PER_USER",
+            DEFAULT_DAILY_MESSAGES,
+            1,
+            100_000,
+        )?;
         Ok(Some(Self {
             client_id,
             client_secret,
             public_origin: public_origin(public_base_url.trim())?,
             bind,
             discord_api: DISCORD_API.into(),
+            daily_messages,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }))
     }
 }
@@ -398,9 +416,14 @@ impl Config {
         if !(1..=3650).contains(&retention_days) {
             bail!("RETENTION_DAYS must be between 1 and 3650");
         }
-        let timeout = number("REQUEST_TIMEOUT_SECONDS", 180_u64)?;
+        let timeout = number("REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT.as_secs())?;
         if !(10..=600).contains(&timeout) {
             bail!("REQUEST_TIMEOUT_SECONDS must be between 10 and 600");
+        }
+        let request_timeout = Duration::from_secs(timeout);
+        let mut web = WebConfig::from_env()?;
+        if let Some(web) = &mut web {
+            web.request_timeout = request_timeout;
         }
         Ok(Self {
             discord_token: required("DISCORD_TOKEN")?,
@@ -412,8 +435,8 @@ impl Config {
             db_user: env::var("MARIADB_USER").unwrap_or_else(|_| "discussion".into()),
             db_password: required("MARIADB_PASSWORD")?,
             retention_days,
-            request_timeout: Duration::from_secs(timeout),
-            web: WebConfig::from_env()?,
+            request_timeout,
+            web,
             kb: KbConfig::from_lookup(|name| env::var(name).ok())?,
         })
     }
@@ -444,7 +467,7 @@ mod tests {
 
     fn web(id: &str, secret: &str, url: &str, bind: &str) -> Result<Option<WebConfig>> {
         let value = |v: &str| Some(v.to_owned());
-        WebConfig::from_values(value(id), value(secret), value(url), value(bind))
+        WebConfig::from_values(value(id), value(secret), value(url), value(bind), None)
     }
 
     #[test]
@@ -463,7 +486,7 @@ mod tests {
     fn web_is_off_unless_fully_configured() {
         assert!(web("", "", "", "").unwrap().is_none());
         assert!(
-            WebConfig::from_values(None, None, None, Some("127.0.0.1:1".into()))
+            WebConfig::from_values(None, None, None, Some("127.0.0.1:1".into()), None)
                 .unwrap()
                 .is_none()
         );
@@ -482,6 +505,26 @@ mod tests {
         assert_eq!(config.redirect_uri(), "https://bot.example/auth/callback");
         assert_eq!(config.bind, DEFAULT_WEB_BIND.parse().unwrap());
         assert!(config.secure());
+        assert_eq!(config.daily_messages, 100);
+        assert_eq!(config.request_timeout, Duration::from_secs(180));
+    }
+
+    #[test]
+    fn the_daily_chat_limit_is_configurable_within_bounds() {
+        let daily = |value: &str| {
+            WebConfig::from_values(
+                Some("1".into()),
+                Some("s".into()),
+                Some("https://bot.example".into()),
+                None,
+                Some(value.into()),
+            )
+        };
+        assert_eq!(daily("").unwrap().unwrap().daily_messages, 100);
+        assert_eq!(daily(" 20 ").unwrap().unwrap().daily_messages, 20);
+        for bad in ["0", "-1", "abc", "100001"] {
+            assert!(daily(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

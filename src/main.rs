@@ -74,7 +74,12 @@ async fn run() -> Result<()> {
         .recover()
         .await
         .map_err(|_| anyhow::anyhow!("database recovery failed"))?;
-    tracing::info!(recovered, "database_ready");
+    // Web chat answers that were being generated when the bot stopped.
+    let interrupted = db
+        .recover_web_messages()
+        .await
+        .map_err(|_| anyhow::anyhow!("database recovery failed"))?;
+    tracing::info!(recovered, interrupted, "database_ready");
     let agent = Agent::new(
         "https://ollama.com",
         config.ollama_api_key.clone(),
@@ -181,7 +186,8 @@ async fn run() -> Result<()> {
     result
 }
 
-/// Hourly: retention of /talk records and expired web sessions. Runs once at startup too.
+/// Hourly: retention of /talk records and web chat conversations (by their last update), and
+/// expired web sessions. Runs once at startup too.
 async fn maintenance(db: Database, retention_days: i64, mut stop: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
     loop {
@@ -193,6 +199,13 @@ async fn maintenance(db: Database, retention_days: i64, mut stop: watch::Receive
         match db.purge(now - chrono::Duration::days(retention_days)).await {
             Ok(deleted) => tracing::info!(deleted, "retention_cleanup"),
             Err(_) => tracing::warn!("retention_cleanup_failed"),
+        }
+        match db
+            .purge_conversations(now - chrono::Duration::days(retention_days))
+            .await
+        {
+            Ok(deleted) => tracing::info!(deleted, "conversation_cleanup"),
+            Err(_) => tracing::warn!("conversation_cleanup_failed"),
         }
         match db.purge_sessions(now).await {
             Ok(deleted) => tracing::info!(deleted, "session_cleanup"),

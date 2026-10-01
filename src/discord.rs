@@ -12,11 +12,11 @@ use tokio::sync::watch;
 
 use crate::{
     access::{self, Access, GuildAccess, MAX_ROLES_PER_KIND, RoleKind, role_mention},
-    agent::{Agent, AgentError, Excerpt},
+    agent::{Agent, AgentError},
     config::Config,
     db::{Database, NewRun, RoleChange},
     history::{self, Entry, History},
-    knowledge::{self, Knowledge, SearchOutcome, store::KbSource},
+    knowledge::{Knowledge, consult},
     limits::{Busy, Key, Limits},
     output::split_message,
     web::{BotGuilds, authz::DiscordCache},
@@ -36,9 +36,6 @@ pub struct Handler {
     /// `None` when the knowledge base is disabled.
     pub knowledge: Option<Arc<Knowledge>>,
 }
-
-/// The knowledge search gets this long; then /talk answers without it.
-const KNOWLEDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 enum TalkError {
@@ -82,64 +79,6 @@ impl TalkError {
             Self::Agent(error) => error.user_message(),
         }
     }
-}
-
-/// What the knowledge base contributed to one /talk run.
-#[derive(Default)]
-struct Consulted {
-    excerpts: Vec<Excerpt>,
-    /// The documents given to the AI; `None` when the knowledge base was not searched.
-    sources: Option<Vec<KbSource>>,
-    notice: Option<&'static str>,
-}
-
-const KNOWLEDGE_DISABLED: &str =
-    "\n\n※このBotではナレッジベースが有効になっていないため、資料を参照せずに回答しました。";
-const KNOWLEDGE_EMPTY: &str =
-    "\n\n※参照できるナレッジ資料が見つからなかったため、資料を参照せずに回答しました。";
-const KNOWLEDGE_FAILED: &str =
-    "\n\n※ナレッジ資料を検索できなかったため、資料を参照せずに回答しました。";
-
-/// `knowledge:false` keeps the question away from the knowledge base and so from the embedding
-/// providers; otherwise /talk searches it when it is enabled.
-fn searches_knowledge(requested: Option<bool>) -> bool {
-    requested != Some(false)
-}
-
-/// What the knowledge base contributes to a /talk run, from the `knowledge` option, whether the
-/// knowledge base is enabled and the search: `None` if there was none, `Err` if it failed or
-/// timed out. `sources` is what talk_runs records (`None`: the knowledge base was not used).
-fn knowledge_outcome(
-    requested: Option<bool>,
-    enabled: bool,
-    search: Option<Result<SearchOutcome, ()>>,
-) -> Consulted {
-    let mut consulted = Consulted::default();
-    let asked = requested == Some(true);
-    match search {
-        None => {
-            if asked && !enabled {
-                consulted.notice = Some(KNOWLEDGE_DISABLED);
-            }
-        }
-        Some(Ok(SearchOutcome::NoDocuments)) => {
-            if asked {
-                consulted.notice = Some(KNOWLEDGE_EMPTY);
-            }
-        }
-        Some(Ok(SearchOutcome::Found(excerpts))) => {
-            if excerpts.is_empty() && asked {
-                consulted.notice = Some(KNOWLEDGE_EMPTY);
-            }
-            consulted.sources = Some(knowledge::sources(&excerpts));
-            consulted.excerpts = excerpts;
-        }
-        Some(Err(())) => {
-            consulted.sources = Some(Vec::new());
-            consulted.notice = Some(KNOWLEDGE_FAILED);
-        }
-    }
-    consulted
 }
 
 pub fn talk_command() -> CreateCommand {
@@ -525,9 +464,13 @@ impl Handler {
             } else {
                 self.load_history(ctx, command, invoked_at, seconds).await?
             };
-            let consulted = self
-                .consult_knowledge(guild.get(), question, use_knowledge)
-                .await;
+            let consulted = consult::consult(
+                self.knowledge.as_deref(),
+                guild.get(),
+                question,
+                use_knowledge,
+            )
+            .await;
             if let Some(sources) = &consulted.sources {
                 self.db
                     .record_knowledge(command.id.get(), Some(sources))
@@ -769,35 +712,6 @@ impl Handler {
         reject(ctx, command, &message).await;
     }
 
-    /// Searches the guild's knowledge base for the question unless the caller turned it off
-    /// (`knowledge:false`). On failure the answer goes ahead without it, with a notice.
-    async fn consult_knowledge(
-        &self,
-        guild: u64,
-        question: &str,
-        requested: Option<bool>,
-    ) -> Consulted {
-        let search = match &self.knowledge {
-            Some(knowledge) if searches_knowledge(requested) => Some(
-                match tokio::time::timeout(KNOWLEDGE_TIMEOUT, knowledge.search(guild, question))
-                    .await
-                {
-                    Ok(Ok(outcome)) => Ok(outcome),
-                    result => {
-                        let error_code = match result {
-                            Ok(Err(error)) => error.to_string(),
-                            _ => "timeout".into(),
-                        };
-                        tracing::warn!(guild_id = guild, error_code, "knowledge_search_failed");
-                        Err(())
-                    }
-                },
-            ),
-            _ => None,
-        };
-        knowledge_outcome(requested, self.knowledge.is_some(), search)
-    }
-
     async fn load_history(
         &self,
         ctx: &Context,
@@ -939,71 +853,6 @@ async fn reject(ctx: &Context, command: &CommandInteraction, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn knowledge_options_decide_search_notice_and_record() {
-        // knowledge:false never sends the question to the embedding providers.
-        assert!(!searches_knowledge(Some(false)));
-        assert!(searches_knowledge(None) && searches_knowledge(Some(true)));
-        let excerpt = Excerpt {
-            document_id: 7,
-            title: "手順書".into(),
-            text: "抜粋".into(),
-        };
-        let found = || Some(Ok(SearchOutcome::Found(vec![excerpt.clone()])));
-        let source = Some(vec![KbSource {
-            id: 7,
-            title: "手順書".into(),
-        }]);
-        // (option, enabled, search) → (notice, recorded sources, excerpts given to the AI)
-        let cases = [
-            (Some(false), true, None, None, None, 0),
-            (None, false, None, None, None, 0),
-            (Some(true), false, None, Some(KNOWLEDGE_DISABLED), None, 0),
-            (
-                None,
-                true,
-                Some(Ok(SearchOutcome::NoDocuments)),
-                None,
-                None,
-                0,
-            ),
-            (
-                Some(true),
-                true,
-                Some(Ok(SearchOutcome::NoDocuments)),
-                Some(KNOWLEDGE_EMPTY),
-                None,
-                0,
-            ),
-            (
-                Some(true),
-                true,
-                Some(Ok(SearchOutcome::Found(Vec::new()))),
-                Some(KNOWLEDGE_EMPTY),
-                Some(Vec::new()),
-                0,
-            ),
-            (None, true, found(), None, source.clone(), 1),
-            (Some(true), true, found(), None, source, 1),
-            // A failure or timeout: the answer says so, and the run records an empty list.
-            (
-                None,
-                true,
-                Some(Err(())),
-                Some(KNOWLEDGE_FAILED),
-                Some(Vec::new()),
-                0,
-            ),
-        ];
-        for (requested, enabled, search, notice, sources, excerpts) in cases {
-            let label = format!("{requested:?} {enabled} {search:?}");
-            let consulted = knowledge_outcome(requested, enabled, search);
-            assert_eq!(consulted.notice, notice, "{label}");
-            assert_eq!(consulted.sources, sources, "{label}");
-            assert_eq!(consulted.excerpts.len(), excerpts, "{label}");
-        }
-    }
 
     #[test]
     fn command_contract_and_mentions() {

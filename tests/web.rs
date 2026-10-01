@@ -68,6 +68,8 @@ fn config(discord: &str) -> WebConfig {
         public_origin: ORIGIN.into(),
         bind: "127.0.0.1:0".parse().unwrap(),
         discord_api: format!("{discord}/api/v10"),
+        daily_messages: 100,
+        request_timeout: Duration::from_secs(180),
     }
 }
 

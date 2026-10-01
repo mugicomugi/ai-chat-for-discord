@@ -31,6 +31,8 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       # Caddy proxies to bot:8080; the port is not published on the host.
       WEB_BIND: 0.0.0.0:8080
+      # Web chat messages per user in 24 hours (empty: 100).
+      WEB_DAILY_MESSAGES_PER_USER: ${WEB_DAILY_MESSAGES_PER_USER:-}
       # Knowledge base (README, docs/runbook.md section 13): off while EMBEDDING_PROVIDERS is
       # empty. Empty values mean the defaults.
       EMBEDDING_PROVIDERS: ${EMBEDDING_PROVIDERS:-}

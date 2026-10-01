@@ -23,6 +23,8 @@ serenity = { version = "0.12.5", default-features = false, features = ["builder"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "mysql", "chrono", "migrate", "macros", "json"] }
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+# The web chat's server-sent events (a stream over an mpsc receiver); already built for sqlx.
+tokio-stream = { version = "0.1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

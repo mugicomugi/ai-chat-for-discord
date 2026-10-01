@@ -3,7 +3,7 @@
 // as text nodes, never as HTML.
 //
 // Screens are registered in `routes`; pages of a server are registered in `guildTabs` with the
-// right they need, so knowledge management (M3) and the chat (M4) are added the same way.
+// right they need. The chat (`#/chat/...`) is a screen of its own with a full-height layout.
 
 const MAX_ROLES_PER_KIND = 25;
 
@@ -121,21 +121,32 @@ export const guildTabs = [
 ];
 
 const GUILD_PATH = /^\/guilds\/(\d{1,20})(?:\/([a-z-]+))?$/;
+const CHAT_PATH = /^\/chat(?:\/(\d{1,20})(?:\/(\d{1,20}))?)?$/;
 
 export const routes = [
   { path: /^\/$/, refresh: true, view: homeView },
   { path: GUILD_PATH, view: guildView },
+  { path: CHAT_PATH, view: chatView },
 ];
+
+/** Guilds where the user may use the bot (and so the chat). */
+function chatGuilds() {
+  return session.me?.guilds.filter((guild) => guild.access?.use) ?? [];
+}
 
 // A server page opened while logged out (for example the link of /config show) is reopened
 // after the login, which always returns to "/". sessionStorage survives the trip to Discord
 // within the tab; without it the user simply lands on the server list.
 const RETURN_KEY = "return-to";
 
+function returnable(path) {
+  return GUILD_PATH.test(path) || CHAT_PATH.test(path);
+}
+
 function rememberReturn() {
   const path = location.hash.replace(/^#/, "");
   try {
-    if (GUILD_PATH.test(path)) {
+    if (returnable(path)) {
       sessionStorage.setItem(RETURN_KEY, path);
     } else {
       sessionStorage.removeItem(RETURN_KEY);
@@ -149,16 +160,22 @@ function takeReturn() {
   try {
     const path = sessionStorage.getItem(RETURN_KEY);
     sessionStorage.removeItem(RETURN_KEY);
-    return path !== null && GUILD_PATH.test(path) ? path : null;
+    return path !== null && returnable(path) ? path : null;
   } catch {
     return null;
   }
 }
 
 let rendering = 0;
+/** Set by a view that must stop work when it is left (the chat's running answer). */
+let leaveView = null;
 
 async function render() {
   const current = ++rendering;
+  if (leaveView) {
+    leaveView();
+    leaveView = null;
+  }
   const path = location.hash.replace(/^#/, "") || "/";
   const route = routes.find((candidate) => candidate.path.test(path));
   let content;
@@ -183,6 +200,8 @@ async function render() {
   // A newer navigation started while this one was loading.
   if (current !== rendering) return;
   renderAccount();
+  // The chat fills the window; other screens keep the page layout.
+  document.body.classList.toggle("chat-mode", content.classList.contains("chat"));
   root.replaceChildren(content);
   const heading = root.querySelector("h1");
   document.title = heading ? `${heading.textContent} - AI Discussion Bot` : "AI Discussion Bot";
@@ -195,6 +214,8 @@ function renderAccount() {
     return;
   }
   account.replaceChildren(
+    h("a", { href: "#/" }, "サーバー"),
+    chatGuilds().length > 0 && h("a", { href: "#/chat" }, "チャット"),
     h("span", { class: "user" }, me.user.name),
     h("button", { type: "button", class: "link", onclick: logout }, "ログアウト"),
   );
@@ -223,7 +244,7 @@ function loginView() {
     h(
       "p",
       {},
-      "Discord アカウントでログインすると、Bot を導入しているサーバーでのあなたの権限を確認でき、サーバー管理者は Bot を使えるロールを設定できます。",
+      "Discord アカウントでログインすると、Bot の利用を許可されたサーバーで AI とチャットでき、サーバー管理者は Bot を使えるロールを設定できます。",
     ),
     h("p", {}, h("a", { class: "button primary", href: "/auth/login", onclick: rememberReturn }, "Discord でログイン")),
     h(
@@ -292,7 +313,13 @@ function guildCard(guild) {
     { class: "card" },
     h("div", { class: "card-title" }, guild.name),
     h("div", { class: "badges" }, badges),
-    tabs.length > 0 && h("a", { class: "button", href: `#/guilds/${guild.id}` }, "開く"),
+    (rights?.use || tabs.length > 0) &&
+      h(
+        "div",
+        { class: "card-actions" },
+        rights?.use && h("a", { class: "button primary", href: `#/chat/${guild.id}` }, "チャット"),
+        tabs.length > 0 && h("a", { class: "button", href: `#/guilds/${guild.id}` }, rights.use ? "管理" : "開く"),
+      ),
   );
 }
 
@@ -768,6 +795,710 @@ function knowledgeView(guild, initial) {
   );
   update(initial);
   return element;
+}
+
+// ---- Chat (M4) ----
+
+const MAX_QUESTION_CHARS = 4000;
+/** Streaming answers are redrawn at most this often. */
+const PAINT_MS = 100;
+/** How close to the bottom (px) counts as following the answer. */
+const FOLLOW_SLACK = 48;
+const CHAT_GUILD_KEY = "chat-guild";
+
+/**
+ * Answers are Markdown from the AI, which reads untrusted material (web pages, documents), so
+ * they are sanitized: no raw HTML from marked, no images, forms, styles, frames, SVG or MathML,
+ * and only http(s) links, which open in a new tab without a referrer.
+ */
+const PURIFY = {
+  USE_PROFILES: { html: true },
+  FORBID_TAGS: [
+    "img", "style", "iframe", "form", "input", "svg", "math", "button", "textarea", "select",
+    "option", "video", "audio", "source", "picture", "object", "embed", "link", "meta", "base",
+  ],
+  FORBID_ATTR: ["style"],
+  ALLOWED_URI_REGEXP: /^https?:\/\//i,
+  ALLOW_DATA_ATTR: false,
+  RETURN_DOM_FRAGMENT: true,
+};
+
+let markdown;
+
+function escapeHtml(text) {
+  return text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+/** Markdown to a sanitized fragment; `null` if the libraries did not load (text is shown then). */
+function markdownRenderer() {
+  if (markdown !== undefined) return markdown;
+  const { marked, DOMPurify } = globalThis;
+  if (!marked?.Marked || !DOMPurify?.sanitize) {
+    markdown = null;
+    return markdown;
+  }
+  const parser = new marked.Marked({ gfm: true, breaks: true, async: false });
+  // HTML written in the Markdown is shown as text.
+  parser.use({ renderer: { html: (token) => escapeHtml(token.text) } });
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    if (node.tagName === "A") {
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer nofollow");
+    }
+  });
+  markdown = (text) => DOMPurify.sanitize(parser.parse(text), PURIFY);
+  return markdown;
+}
+
+function renderMarkdown(text) {
+  const render = markdownRenderer();
+  return render ? render(text) : h("p", { class: "plain" }, text);
+}
+
+function loadPreference(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function savePreference(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Storage disabled.
+  }
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+}
+
+function webLink(source) {
+  const label = source.title || source.url;
+  if (!/^https?:\/\//i.test(source.url)) return label;
+  return h(
+    "span",
+    {},
+    h("a", { href: source.url, target: "_blank", rel: "noopener noreferrer nofollow" }, label),
+    " ",
+    h("span", { class: "muted" }, hostOf(source.url)),
+  );
+}
+
+const TOOL_LABELS = { web_search: "Web検索", web_fetch: "ページ取得" };
+
+/** Server-sent events from a fetch() body (EventSource cannot POST). */
+async function readEvents(body, onEvent) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const flush = () => {
+    let end;
+    while ((end = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, end);
+      buffer = buffer.slice(end + 2);
+      let name = "message";
+      const data = [];
+      for (const line of block.split("\n")) {
+        if (line === "" || line.startsWith(":")) continue;
+        const colon = line.indexOf(":");
+        const field = colon < 0 ? line : line.slice(0, colon);
+        let value = colon < 0 ? "" : line.slice(colon + 1);
+        if (value.startsWith(" ")) value = value.slice(1);
+        if (field === "event") name = value;
+        else if (field === "data") data.push(value);
+      }
+      if (data.length === 0) continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(data.join("\n"));
+      } catch {
+        continue;
+      }
+      onEvent(name, parsed);
+    }
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    flush();
+  }
+  buffer += decoder.decode();
+  flush();
+}
+
+async function chatView(guildId, conversationId) {
+  const guilds = chatGuilds();
+  if (guilds.length === 0) {
+    return messageView(
+      "チャットを使えるサーバーがありません。サーバーの管理者が許可したロールを持っている場合は、ログインし直すと表示されることがあります。",
+    );
+  }
+  if (!guildId) {
+    const remembered = loadPreference(CHAT_GUILD_KEY);
+    const target = guilds.find((guild) => guild.id === remembered) ?? guilds[0];
+    location.replace(`#/chat/${target.id}`);
+    return h("p", { class: "muted" }, "読み込み中…");
+  }
+  const guild = guilds.find((candidate) => candidate.id === guildId);
+  if (!guild) return messageView("このサーバーではチャットを使えません。");
+  savePreference(CHAT_GUILD_KEY, guild.id);
+  const [listing, detail] = await Promise.all([
+    api("GET", `/api/conversations?guild=${guild.id}`),
+    conversationId
+      ? api("GET", `/api/conversations/${conversationId}`).catch((error) => {
+          if (error.status === 404) return null;
+          throw error;
+        })
+      : null,
+  ]);
+  if (conversationId && !detail) {
+    return messageView("この会話は見つかりません。削除されたか、保存期間を過ぎた可能性があります。", h("p", {}, h("a", { href: `#/chat/${guild.id}` }, "新しい会話を始める")));
+  }
+  if (detail && detail.guild_id !== guild.id) {
+    location.replace(`#/chat/${detail.guild_id}/${detail.id}`);
+    return h("p", { class: "muted" }, "読み込み中…");
+  }
+  return chatScreen(guild, guilds, listing, detail);
+}
+
+function chatScreen(guild, guilds, initialListing, detail) {
+  let listing = initialListing;
+  let conversation = detail;
+  /** The answer this tab is generating: { controller, view }. */
+  let active = null;
+  let follow = true;
+
+  const status = h("p", { class: "status", role: "status" });
+  const showStatus = (message, kind = "") => {
+    status.className = kind ? `status ${kind}` : "status";
+    status.textContent = message ?? "";
+  };
+
+  // Sidebar.
+  const select = h(
+    "select",
+    {
+      "aria-label": "サーバー",
+      onchange: () => {
+        location.hash = `#/chat/${select.value}`;
+      },
+    },
+    guilds.map((candidate) => h("option", { value: candidate.id, selected: candidate.id === guild.id }, candidate.name)),
+  );
+  const list = h("ul", { class: "conversations" });
+  const usage = h("p", { class: "muted usage" });
+  const sidebar = h(
+    "aside",
+    {
+      class: "chat-sidebar",
+      "aria-label": "会話",
+      // On narrow screens the list is a panel; following one of its links closes it.
+      onclick: (event) => {
+        if (event.target.closest("a")) screen.classList.remove("sidebar-open");
+      },
+    },
+    h("label", { class: "field" }, h("span", { class: "muted" }, "サーバー"), select),
+    h("a", { class: "button primary new-chat", href: `#/chat/${guild.id}` }, "新しい会話"),
+    list,
+    usage,
+    h(
+      "p",
+      { class: "muted small-print" },
+      "会話は最終更新から一定期間（既定 30 日）保存され、その後自動で削除されます。一覧からいつでも削除できます。",
+      h("a", { href: "/privacy" }, "プライバシーポリシー"),
+      " · ",
+      h("a", { href: "/terms" }, "利用規約"),
+    ),
+  );
+
+  // Messages.
+  const messages = h("div", {
+    class: "chat-messages",
+    role: "log",
+    "aria-live": "polite",
+    onscroll: () => {
+      follow = messages.scrollHeight - messages.scrollTop - messages.clientHeight < FOLLOW_SLACK;
+    },
+  });
+  const keepUp = () => {
+    if (follow) messages.scrollTop = messages.scrollHeight;
+  };
+  const empty = h(
+    "div",
+    { class: "chat-empty" },
+    h("p", {}, `「${guild.name}」の Bot に質問できます。`),
+    h(
+      "p",
+      { class: "muted" },
+      "「Web検索」を選ぶと、AI が必要に応じて Web を検索して出典付きで回答します。「ナレッジ」はこのサーバーに登録された資料を参照します。Discord のチャンネルの投稿は参照しません。回答は誤りを含むことがあります。",
+    ),
+  );
+
+  const titleText = () => conversation?.title ?? "新しい会話";
+  const heading = h("h1", {}, titleText());
+  const toggle = h(
+    "button",
+    {
+      type: "button",
+      class: "sidebar-toggle",
+      "aria-expanded": "false",
+      onclick: () => {
+        const open = !screen.classList.contains("sidebar-open");
+        screen.classList.toggle("sidebar-open", open);
+        toggle.setAttribute("aria-expanded", String(open));
+      },
+    },
+    "会話一覧",
+  );
+
+  // Composer.
+  const textarea = h("textarea", {
+    rows: 3,
+    placeholder: "メッセージを入力（Enter で送信、Shift+Enter で改行）",
+    "aria-label": "メッセージ",
+    oninput: () => updateCounter(),
+    onkeydown: (event) => {
+      // Not while an input method is composing (Enter then confirms the conversion).
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+        event.preventDefault();
+        if (!active) form.requestSubmit();
+      }
+    },
+  });
+  const counter = h("span", { class: "counter" });
+  const webBox = h("input", { type: "checkbox" });
+  const knowledgeBox = h("input", { type: "checkbox" });
+  const knowledgeLabel = h("label", { class: "option" }, knowledgeBox, "ナレッジ");
+  const sendButton = h("button", { type: "submit", class: "primary send" }, "送信");
+  const updateCounter = () => {
+    const count = [...textarea.value].length;
+    counter.textContent = `${count.toLocaleString("ja-JP")} / ${MAX_QUESTION_CHARS.toLocaleString("ja-JP")}`;
+    counter.className = count > MAX_QUESTION_CHARS ? "counter over" : "counter";
+  };
+  const setGenerating = (generating) => {
+    sendButton.textContent = generating ? "停止" : "送信";
+    sendButton.className = generating ? "danger send" : "primary send";
+    sendButton.disabled = false;
+  };
+  const form = h(
+    "form",
+    {
+      class: "composer",
+      onsubmit: (event) => {
+        event.preventDefault();
+        if (active) {
+          stop();
+        } else {
+          send();
+        }
+      },
+    },
+    textarea,
+    h(
+      "div",
+      { class: "composer-bar" },
+      h("label", { class: "option" }, webBox, "Web検索"),
+      knowledgeLabel,
+      counter,
+      sendButton,
+    ),
+    status,
+  );
+
+  const screen = h(
+    "div",
+    { class: "chat" },
+    sidebar,
+    h(
+      "section",
+      { class: "chat-main" },
+      h("header", { class: "chat-header" }, toggle, heading, h("span", { class: "muted guild-name" }, guild.name)),
+      messages,
+      form,
+    ),
+  );
+
+  const renderList = () => {
+    list.replaceChildren(
+      ...listing.conversations.map((item) => {
+        const current = conversation?.id === item.id;
+        return h(
+          "li",
+          { class: current ? "active" : "" },
+          h(
+            "a",
+            { href: `#/chat/${guild.id}/${item.id}`, "aria-current": current ? "page" : null, class: item.title ? "" : "untitled" },
+            item.title ?? "新しい会話",
+          ),
+          h(
+            "span",
+            { class: "item-actions" },
+            h("button", { type: "button", class: "small", title: "名前を変更", onclick: () => rename(item) }, "名前"),
+            h("button", { type: "button", class: "small danger", title: "削除", onclick: () => remove(item) }, "削除"),
+          ),
+        );
+      }),
+    );
+    if (listing.conversations.length === 0) {
+      list.append(h("li", { class: "muted none" }, "まだ会話はありません。"));
+    }
+    const { daily_used: used, daily_limit: limit } = listing;
+    usage.textContent = `直近24時間の送信: ${used} / ${limit} 件`;
+    usage.className = used >= limit ? "usage status warn" : "muted usage";
+    knowledgeLabel.hidden = !listing.knowledge;
+  };
+
+  const refreshList = async () => {
+    try {
+      listing = await api("GET", `/api/conversations?guild=${guild.id}`);
+      if (conversation) {
+        const updated = listing.conversations.find((item) => item.id === conversation.id);
+        if (updated) {
+          conversation = { ...conversation, ...updated };
+          heading.textContent = titleText();
+          document.title = `${titleText()} - AI Discussion Bot`;
+        }
+      }
+      renderList();
+    } catch (error) {
+      if (error.status === 401) render();
+    }
+  };
+
+  const rename = async (item) => {
+    const title = prompt("会話の名前（100文字まで）", item.title ?? "");
+    if (title === null) return;
+    try {
+      await api("PATCH", `/api/conversations/${item.id}`, { title });
+      showStatus("名前を変更しました。", "ok");
+      await refreshList();
+    } catch (error) {
+      if (error.status === 401) return render();
+      showStatus(error.message, "error");
+    }
+  };
+
+  const remove = async (item) => {
+    const name = item.title ?? "新しい会話";
+    if (!confirm(`「${name}」を削除しますか？ この会話のメッセージはすべて削除され、元に戻せません。`)) return;
+    try {
+      await api("DELETE", `/api/conversations/${item.id}`);
+    } catch (error) {
+      if (error.status === 401) return render();
+      showStatus(error.message, "error");
+      return;
+    }
+    if (conversation?.id === item.id) {
+      location.hash = `#/chat/${guild.id}`;
+    } else {
+      showStatus(`「${name}」を削除しました。`, "ok");
+      await refreshList();
+    }
+  };
+
+  const addUser = (message) => {
+    empty.remove();
+    const options = [message.web_search && "Web検索", message.knowledge && "ナレッジ"].filter(Boolean);
+    const element = h(
+      "div",
+      { class: "msg user" },
+      h("div", { class: "bubble" }, message.content),
+      options.length > 0 && h("div", { class: "msg-meta muted" }, options.join(" · ")),
+    );
+    messages.append(element);
+    return element;
+  };
+
+  const addAnswer = (message) => {
+    empty.remove();
+    const view = answerView(message, keepUp);
+    messages.append(view.element);
+    return view;
+  };
+
+  const send = async () => {
+    const content = textarea.value;
+    if (!content.trim()) {
+      showStatus("メッセージを入力してください。", "error");
+      return;
+    }
+    if ([...content].length > MAX_QUESTION_CHARS) {
+      showStatus(`メッセージは ${MAX_QUESTION_CHARS.toLocaleString("ja-JP")} 文字までです。`, "error");
+      return;
+    }
+    showStatus("");
+    const controller = new AbortController();
+    const run = { controller, view: null, stopping: false };
+    active = run;
+    setGenerating(true);
+    try {
+      if (!conversation) {
+        conversation = await api("POST", `/api/conversations?guild=${guild.id}`);
+        history.replaceState(null, "", `#/chat/${guild.id}/${conversation.id}`);
+      }
+      const options = { web_search: webBox.checked, knowledge: !knowledgeLabel.hidden && knowledgeBox.checked };
+      const question = addUser({ content, ...options });
+      run.view = addAnswer({ content: "", status: "streaming", sources: [], kb_sources: [], tool_count: 0 });
+      textarea.value = "";
+      updateCounter();
+      follow = true;
+      keepUp();
+      const response = await fetch(`/api/conversations/${conversation.id}/messages`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
+        body: JSON.stringify({ content, ...options }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        let data = null;
+        try {
+          data = await response.json();
+        } catch {
+          // Not JSON (for example a proxy error page).
+        }
+        if (response.status === 401) {
+          session.me = null;
+          render();
+          return;
+        }
+        // Nothing was stored: take the question back into the box.
+        question.remove();
+        run.view.element.remove();
+        textarea.value = content;
+        updateCounter();
+        showStatus(data?.message ?? `エラーが発生しました（HTTP ${response.status}）。時間をおいて再試行してください。`, "error");
+        return;
+      }
+      let ended = false;
+      await readEvents(response.body, (name, data) => {
+        const view = run.view;
+        switch (name) {
+          case "delta":
+            view.append(data.text);
+            break;
+          case "reset":
+            view.reset();
+            break;
+          case "tool":
+            view.tool(data.name, data.detail);
+            break;
+          case "kb_sources":
+            view.knowledge(data.kb_sources);
+            break;
+          case "sources":
+            view.sources(data.sources);
+            break;
+          case "done":
+            ended = true;
+            view.finish(data.status);
+            break;
+          case "error":
+            ended = true;
+            view.fail(data.message);
+            break;
+        }
+      });
+      if (!ended) {
+        run.view.fail(run.stopping ? null : "接続が切れました。保存された内容は、ページを再読み込みすると確認できます。");
+      }
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        run.view?.finish("stopped");
+      } else if (error instanceof ApiError) {
+        if (error.status === 401) return render();
+        run.view?.element.remove();
+        textarea.value = content;
+        updateCounter();
+        showStatus(error.message, "error");
+      } else {
+        run.view?.fail("サーバーとの接続が切れました。通信状況を確認してください。");
+      }
+    } finally {
+      if (active === run) active = null;
+      setGenerating(false);
+      if (screen.isConnected) await refreshList();
+    }
+  };
+
+  const stop = async () => {
+    const run = active;
+    if (!run || run.stopping) return;
+    run.stopping = true;
+    sendButton.disabled = true;
+    try {
+      // The server saves the text so far and ends the stream with `done`.
+      await api("POST", "/api/chat/stop");
+    } catch {
+      // Closing the stream stops the answer too.
+    }
+    setTimeout(() => {
+      if (active === run) run.controller.abort();
+    }, 3000);
+  };
+
+  leaveView = () => active?.controller.abort();
+
+  // Earlier messages.
+  if (conversation) {
+    for (const message of conversation.messages) {
+      if (message.role === "user") addUser(message);
+      else addAnswer(message);
+    }
+  }
+  if (!conversation || conversation.messages.length === 0) messages.append(empty);
+  webBox.checked = false;
+  knowledgeBox.checked = true;
+  renderList();
+  updateCounter();
+  setGenerating(false);
+  requestAnimationFrame(() => {
+    messages.scrollTop = messages.scrollHeight;
+    if (!conversation) textarea.focus();
+  });
+  return screen;
+}
+
+/** One answer: its Markdown, what it consulted, and how it ended. */
+function answerView(message, keepUp) {
+  let text = message.content ?? "";
+  let painted = 0;
+  let timer = null;
+  let toolCount = message.tool_count ?? 0;
+  let webSources = message.sources ?? [];
+  let documents = message.kb_sources ?? [];
+  const body = h("div", { class: "markdown" });
+  const activity = h("p", { class: "activity muted" });
+  const note = h("p", { class: "status" });
+  const consulted = h("div", { class: "consulted" });
+  const copy = h(
+    "button",
+    {
+      type: "button",
+      class: "small",
+      onclick: async () => {
+        try {
+          await navigator.clipboard.writeText(text);
+          copy.textContent = "コピーしました";
+        } catch {
+          copy.textContent = "コピーできませんでした";
+        }
+        setTimeout(() => (copy.textContent = "コピー"), 2000);
+      },
+    },
+    "コピー",
+  );
+  const actions = h("div", { class: "msg-actions" }, copy);
+  const element = h("div", { class: "msg assistant" }, activity, body, note, consulted, actions);
+
+  const paint = () => {
+    timer = null;
+    painted = Date.now();
+    body.replaceChildren(renderMarkdown(text));
+    keepUp();
+  };
+  // At most one redraw per PAINT_MS while text streams in.
+  const schedule = () => {
+    if (timer) return;
+    const wait = Math.max(0, painted + PAINT_MS - Date.now());
+    timer = setTimeout(paint, wait);
+  };
+  const showConsulted = () => {
+    const groups = [];
+    if (webSources.length > 0) {
+      groups.push(h("div", { class: "consulted-group" }, h("div", { class: "consulted-title" }, "参照したWeb資料"), h("ol", {}, webSources.map((source) => h("li", {}, webLink(source))))));
+    }
+    if (documents.length > 0) {
+      groups.push(h("div", { class: "consulted-group" }, h("div", { class: "consulted-title" }, "参照したナレッジ資料"), h("ul", {}, documents.map((document) => h("li", {}, document.title)))));
+    }
+    consulted.replaceChildren(...groups);
+    consulted.hidden = groups.length === 0;
+    keepUp();
+  };
+  const showNote = (message, kind) => {
+    note.className = kind ? `status ${kind}` : "status";
+    note.textContent = message ?? "";
+    keepUp();
+  };
+  const settle = () => {
+    clearTimeout(timer);
+    activity.textContent = toolCount > 0 ? `Web検索・ページ取得: ${toolCount} 回` : "";
+    actions.hidden = text.trim() === "";
+    element.removeAttribute("aria-busy");
+    // Last, so that following the answer scrolls to its final size.
+    paint();
+  };
+
+  const view = {
+    element,
+    append(delta) {
+      if (text === "") activity.textContent = "";
+      text += delta;
+      schedule();
+    },
+    reset() {
+      text = "";
+      schedule();
+    },
+    tool(name, detail) {
+      toolCount += 1;
+      activity.textContent = `${TOOL_LABELS[name] ?? "ツール"}中: ${detail}`;
+    },
+    knowledge(list) {
+      documents = list ?? [];
+      showConsulted();
+    },
+    sources(list) {
+      webSources = list ?? [];
+      showConsulted();
+    },
+    finish(status) {
+      settle();
+      if (status === "stopped") showNote("回答を停止しました。", "warn");
+    },
+    fail(message) {
+      settle();
+      if (message) showNote(message, "error");
+      else showNote("回答を停止しました。", "warn");
+    },
+  };
+
+  showConsulted();
+  switch (message.status) {
+    case "streaming":
+      if (text === "") {
+        element.setAttribute("aria-busy", "true");
+        activity.textContent = "考えています…";
+        actions.hidden = true;
+      } else {
+        settle();
+      }
+      if (message.id !== undefined) {
+        // Being generated in another tab or window.
+        showNote("この回答は別のタブまたはウィンドウで作成中です。完了後に再読み込みすると表示されます。", "warn");
+      }
+      break;
+    case "stopped":
+      settle();
+      showNote("回答を停止しました。", "warn");
+      break;
+    case "failed":
+    case "interrupted":
+      settle();
+      showNote(message.error ?? "回答を作成できませんでした。", "error");
+      break;
+    default:
+      settle();
+  }
+  return view;
 }
 
 window.addEventListener("hashchange", () => render());

@@ -3,6 +3,7 @@
 //! /talk. Optional: without EMBEDDING_PROVIDERS none of this runs.
 
 pub mod chunk;
+pub mod consult;
 pub mod embed;
 pub mod extract;
 pub mod store;

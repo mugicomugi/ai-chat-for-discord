@@ -96,6 +96,15 @@ jobs:
         run: cargo test --locked --test knowledge knowledge_prune_embeddings -- --ignored --exact
       - name: Knowledge web API test
         run: cargo test --locked --test web knowledge_web_api -- --ignored --exact
+      - name: Web chat test
+        run: cargo test --locked --test chat web_chat -- --ignored --exact
+      - name: Web chat knowledge test
+        run: cargo test --locked --test chat web_chat_knowledge_notices -- --ignored --exact
+      - name: Web chat stop test
+        run: cargo test --locked --test chat web_chat_stops_with_partial_text -- --ignored --exact
+      # Marks every streaming answer interrupted (as at startup), so it runs alone.
+      - name: Web chat retention and recovery test
+        run: cargo test --locked --test chat web_chat_retention_and_recovery -- --ignored --exact
       # Uses the vectors knowledge_vectors leaves behind; backups depend on this (scripts/backup.sh).
       - name: VECTOR backup round trip (mariadb-dump --hex-blob)
         run: scripts/check-vector-dump.sh

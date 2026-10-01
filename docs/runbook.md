@@ -264,11 +264,13 @@ age -d -i discussion-backup-identity.txt discussion-XXXX.sql.zst.age | zstd -d \
 利用者から自分のデータの削除を依頼されたときの手順です（M5「プライバシー・運用の仕上げ」で `/privacy` コマンドによるセルフサービスに置き換えます）。
 
 1. 依頼者の Discord ユーザー ID を確認する。
-2. 削除する（回答の投稿記録 `talk_replies` は外部キーで一緒に消えます。`web_sessions` は Web 管理画面のログイン情報で、消すとその人はログアウトします）。
+2. 削除する（回答の投稿記録 `talk_replies` と Web チャットのメッセージ `web_messages` は外部キーで一緒に消えます。`web_sessions` は Web 管理画面のログイン情報で、消すとその人はログアウトします）。生成中の Web チャットの回答があれば、保存先が消えるので保存されずに終わります。
 
    ```bash
-   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM talk_runs WHERE user_id = <USER_ID>; DELETE FROM web_sessions WHERE user_id = <USER_ID>; UPDATE kb_documents SET uploaded_by = NULL, uploaded_by_name = NULL WHERE uploaded_by = <USER_ID>"'
+   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM talk_runs WHERE user_id = <USER_ID>; DELETE FROM web_conversations WHERE user_id = <USER_ID>; DELETE FROM web_sessions WHERE user_id = <USER_ID>; UPDATE kb_documents SET uploaded_by = NULL, uploaded_by_name = NULL WHERE uploaded_by = <USER_ID>"'
    ```
+
+   Web チャットの会話は、本人も画面からいつでも削除できます。
 
    ナレッジ資料はサーバーのもの（そのサーバーのナレッジ管理者が管理）なので、資料そのものは消さず、登録者の ID と名前だけを消します。資料の内容に依頼者の個人情報が含まれている場合は、そのサーバーのナレッジ管理者に資料の削除を依頼するか、運営者が `DELETE FROM kb_documents WHERE id = <ID>` で削除します（チャンクとベクトルも一緒に消えます）。
 
@@ -430,6 +432,16 @@ Discord でログインしてロールを設定できる画面（README の「We
 - **証明書**: `caddy_data` ボリュームに保存されます。消すと再取得になり、Let's Encrypt の発行回数の上限に当たることがあるので、`docker compose down -v` は使いません。
 - **Client Secret の交換**: Developer Portal で Reset Secret し、`.env` を書き換えて `sudo scripts/deploy.sh "$(sed -n 's/^BOT_IMAGE=//p' .env)"`。ログイン中のセッションはそのまま使えます。
 - **全員をログアウトさせる**: `sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM web_sessions"'`
+
+### Web チャット
+
+Web 管理画面を公開すると、利用ロールを持つ人は Web チャット（README の「Webチャット」）も使えます。追加の設定は必須ではありません。
+
+- **Ollama の利用量**: 1 人が直近 24 時間に送れるメッセージは `WEB_DAILY_MESSAGES_PER_USER`（既定 100 件）までです。変えるときは `.env` に書いて Bot を作り直します（`sudo scripts/deploy.sh "$(sed -n 's/^BOT_IMAGE=//p' .env)"`）。生成は `/talk` と合わせて同時に 4 件まで、1 回の回答は `REQUEST_TIMEOUT_SECONDS` までです。
+- **ストリーミング**: 回答は Server-Sent Events で送ります。Caddyfile の `flush_interval -1` が必要です（外すと、回答が最後にまとめて表示されます）。
+- **ログ**: `web_chat_started`・`web_chat_finished`（`status` が `completed`／`stopped`、`reason` が `stopped`／`disconnected`）・`web_chat_failed`（`error_code`）・`web_chat_daily_limit` を記録します。質問・回答の本文は記録しません。
+- **保存期間**: 会話は最終更新から `RETENTION_DAYS` で、1 時間ごとの処理（ログ `conversation_cleanup`）が削除します。
+- **停止・再起動**: 生成中の回答は、Bot の停止時に途中までの本文を「中断」として保存します。保存できなかったものも、次の起動時に「中断」になります（ログ `database_ready` の `interrupted`）。自動で再生成はしません。
 - **公開をやめる**: `.env` の 3 つの変数を空にして `COMPOSE_PROFILES` を消し、Bot を作り直す（上の deploy.sh）。続けて `sudo docker compose --profile web stop caddy` と `sudo docker compose --profile web rm -f caddy` で Caddy を止め、OCI のセキュリティリストから 80/443 を外す。最後に `sudoedit /etc/discussion-bot/ops.env` で `DOMAIN=""` にする（残っていると、healthwatch が証明書を確認できないという通知を 6 時間ごとに送り続けます）。
 
 ## 13. ナレッジベース

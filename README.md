@@ -1,6 +1,6 @@
 # Discord AI Discussion Bot
 
-Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネルの過去の投稿を文脈としてOllama Cloudの `gpt-oss:120b` に渡します。BotとMariaDB 12.3をDocker Composeで起動できます。GPU・ローカルOllamaは不要です。
+Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネルの過去の投稿を文脈としてOllama Cloudの `gpt-oss:120b` に渡します。Web画面（任意）では、同じBotと会話できる[Webチャット](#webチャット)も使えます。BotとMariaDB 12.3をDocker Composeで起動できます。GPU・ローカルOllamaは不要です。
 
 本番（Oracle Cloud の 1GB VM）の構築・デプロイ・バックアップ・監視は [docs/runbook.md](docs/runbook.md) を参照してください。本番のイメージは VM 上で `scripts/build-image.sh` によりビルドします（メモリ上限と低い優先度で動かし、稼働中の Bot と DB への影響を抑えます）。
 
@@ -110,7 +110,7 @@ docker compose up -d
 
 ## Web管理画面
 
-Discordアカウントでログインして、Botを導入しているサーバーでの自分の権限を確認し、サーバー管理者は利用ロール・ナレッジ管理ロールを、ナレッジ管理ロールを持つ人は[ナレッジベース](#ナレッジベース)の資料を管理できる画面です（Webチャットは今後追加します。[docs/roadmap.md](docs/roadmap.md)）。BotとMariaDBに加えてCaddy（HTTPS）を動かし、`https://<ドメイン>/` で公開します。**任意の機能**で、下の3つの環境変数を設定しなければ起動せず、Botはこれまでどおり動きます。本番での公開手順（DNS、OCIのポート、Caddy、監視）は [docs/runbook.md](docs/runbook.md) の「12. Web 管理画面を公開する」を参照してください。
+Discordアカウントでログインして、Botを導入しているサーバーでの自分の権限を確認し、利用ロールを持つ人は[Webチャット](#webチャット)でAIと会話でき、サーバー管理者は利用ロール・ナレッジ管理ロールを、ナレッジ管理ロールを持つ人は[ナレッジベース](#ナレッジベース)の資料を管理できる画面です。BotとMariaDBに加えてCaddy（HTTPS）を動かし、`https://<ドメイン>/` で公開します。**任意の機能**で、下の3つの環境変数を設定しなければ起動せず、Botはこれまでどおり動きます。本番での公開手順（DNS、OCIのポート、Caddy、監視）は [docs/runbook.md](docs/runbook.md) の「12. Web 管理画面を公開する」を参照してください。
 
 ### 設定
 
@@ -135,6 +135,7 @@ Discordアカウントでログインして、Botを導入しているサーバ�
 | `PUBLIC_BASE_URL` | なし | 画面のURL（`https://<ドメイン>`、パスなし）。`https` のみ。手元の確認用に `http://localhost[:ポート]` だけ例外 |
 | `WEB_BIND` | `0.0.0.0:8080` | Botが待ち受けるアドレス。Composeでは `0.0.0.0:8080` に固定（ホストには公開せず、Caddyだけが接続）。`cargo run` で手元から使うときだけ設定します |
 | `DOMAIN` | なし | Caddyが証明書を取得するドメイン（`PUBLIC_BASE_URL` のホスト名と同じ） |
+| `WEB_DAILY_MESSAGES_PER_USER` | `100` | [Webチャット](#webチャット)で1人が直近24時間に送れるメッセージ数（1〜100000） |
 | `COMPOSE_PROFILES` | なし | `web` でCaddyを起動します |
 
 `DISCORD_CLIENT_ID`・`DISCORD_CLIENT_SECRET`・`PUBLIC_BASE_URL` は3つそろうと有効になり、一部だけ設定するとBotは起動エラーになります。
@@ -148,11 +149,25 @@ Discordアカウントでログインして、Botを導入しているサーバ�
 - **ロール設定の保存**：利用ロールとナレッジ管理ロールを1回の操作でまとめて置き換えます（各25個まで。サーバーに存在しないロールは保存できません）。Discordで削除済みのロールが設定に残っていた場合は、保存すると外れます。
 - **安全対策**：インラインスクリプトを使わず、外部のスクリプト・画像を読み込まない Content-Security-Policy、`X-Content-Type-Options: nosniff` などのヘッダーを付けます。GET以外のリクエストは `Origin` が `PUBLIC_BASE_URL` と一致しなければ拒否し、JSONの送信には `Content-Type: application/json` を必須にしています（CSRF対策）。HTTPS・HSTSはCaddyが担当します。
 - **ページ**：`/privacy` と `/terms` で [docs/privacy.md](docs/privacy.md) と [docs/terms.md](docs/terms.md) を表示します（イメージに組み込むので、変更はイメージの再ビルドで反映されます）。`/healthz` は外部監視用です（DBとDiscordへの接続が正常なら200）。
-- 画面はビルド不要の素のHTML/JS/CSS（`static/`）で、バイナリに組み込まれます。将来のMarkdown表示用に [marked](https://github.com/markedjs/marked) と [DOMPurify](https://github.com/cure53/DOMPurify) を `static/vendor/` に同梱しています（ライセンスは `static/vendor/LICENSES.txt`）。
+- 画面はビルド不要の素のHTML/JS/CSS（`static/`）で、バイナリに組み込まれます。Webチャットの回答の表示に [marked](https://github.com/markedjs/marked) と [DOMPurify](https://github.com/cure53/DOMPurify) を `static/vendor/` に同梱しています（ライセンスは `static/vendor/LICENSES.txt`）。
 
 ### 手元で試す
 
 Developer Portal の Redirects に `http://localhost:8080/auth/callback` も追加し、`.env` で `PUBLIC_BASE_URL=http://localhost:8080` と `WEB_BIND=127.0.0.1:8080` を設定して `cargo run` します（このときCookieは `__Host-` なし・Secureなしになります）。
+
+## Webチャット
+
+[Web管理画面](#web管理画面)の「チャット」で、Botの利用を許可されたサーバーごとにAIと会話できます（Open WebUI 風）。使えるのは `/talk` と同じく、そのサーバーの利用ロールを持つ人だけです（サーバー一覧の「チャット」ボタン、または画面上部の「チャット」から開きます）。Web管理画面を有効にすれば使え、追加の設定は必須ではありません。
+
+- **画面**：左にサーバーの選択、「新しい会話」、会話の一覧（名前の変更・削除）、右に会話と入力欄があります。Enter で送信、Shift+Enter で改行（日本語の変換中の Enter では送信しません）。生成中は送信ボタンが「停止」になります。幅の狭い画面では「会話一覧」ボタンで一覧を開きます。
+- **オプション**：メッセージごとに「Web検索」（`/talk` の `web_search` と同じ）と「ナレッジ」を選べます。「ナレッジ」は、そのサーバーに「利用できます」の資料があるときだけ表示され、既定でオンです。検索できなかったときや資料が見つからなかったときは、`/talk` と同じく回答の末尾に付記します。参照したWeb資料とナレッジ資料は回答の下に一覧で表示します（回答本文には付けません）。
+- **文脈**：同じ会話の過去のやり取りを、新しいものから最大20件（10往復）・24,000文字までAIに渡します（回答は1件4,000文字まで）。失敗・中断した回答とその質問は含めず、停止した回答は途中までの本文を含めます。Discordのチャンネルの投稿や `/talk` の履歴は参照しません。会話の名前は、最初のメッセージの先頭40文字になります（AIは使いません）。
+- **表示**：回答は生成されるそばから表示します（Server-Sent Events。15秒ごとに keep-alive）。回答のMarkdownは marked でHTMLにし（Markdownに書かれたHTMLは文字として表示）、DOMPurify で無害化してから表示します。画像・フォーム・スタイル・iframe・SVG・MathML は表示せず、リンクは http(s) だけを、新しいタブで（`rel="noopener noreferrer nofollow"`）開きます。質問は常に文字として表示します。回答はボタンでコピーできます。
+- **停止・中断**：停止ボタン、タブを閉じる（接続が切れる）、Botの停止・再起動、`REQUEST_TIMEOUT_SECONDS` の経過のいずれかで生成を止め、それまでの本文を「停止」「中断」「失敗」の印とともに保存します。再起動時に生成中のまま残っていた回答は「中断」になります。自動で再生成はしません。
+- **制限**：メッセージは1〜4,000文字です。生成は1人1件ずつで（別のタブで生成中なら「作成中です」と表示）、Bot全体では `/talk` と合わせて同時に4件までです（満杯なら「混み合っています」と表示し、メッセージは保存しません）。1人が直近24時間に送れるメッセージは `WEB_DAILY_MESSAGES_PER_USER`（既定100件）までで、会話を削除しても数は減りません（Botを再起動した後は、削除済みの会話の分は数えません）。1つの会話に送れるのは100件までです。
+- **権限**：会話の一覧・作成・送信のたびに、そのサーバーでの利用権限を確認します。ロールを外されると最大60秒で、`ops guild deny` やBotがサーバーから外されたときは直ちに使えなくなります。会話は本人だけのもので、他人の会話は存在しないものとして扱います（404）。
+- **保存**：会話（質問・回答・参照したWeb資料とナレッジ資料・オプション・状態）はDBに保存し、最終更新から `RETENTION_DAYS`（既定30日）で自動で削除します（1時間ごとの処理）。会話は一覧からいつでも削除でき、メッセージもすべて削除されます。
+- **送信先**：`/talk` と同じく、質問・同じ会話の過去のやり取り・検索結果・ナレッジ資料の抜粋をOllama Cloudへ送ります（[docs/privacy.md](docs/privacy.md)）。ログには質問・回答の本文を記録しません。
 
 ## ナレッジベース
 
@@ -269,6 +284,10 @@ cargo test --locked --test knowledge knowledge_worker_failover_and_backfill -- -
 cargo test --locked --test knowledge knowledge_worker_restart_and_rate_limits -- --ignored --exact
 cargo test --locked --test knowledge knowledge_worker_failures_and_deletion -- --ignored --exact
 cargo test --locked --test web knowledge_web_api -- --ignored --exact
+cargo test --locked --test chat web_chat -- --ignored --exact
+cargo test --locked --test chat web_chat_knowledge_notices -- --ignored --exact
+cargo test --locked --test chat web_chat_stops_with_partial_text -- --ignored --exact
+cargo test --locked --test chat web_chat_retention_and_recovery -- --ignored --exact
 bash scripts/check-vector-dump.sh
 Remove-Item Env:TEST_DATABASE_URL
 ```
@@ -306,7 +325,8 @@ cargo test --locked --test live_embed -- --ignored --nocapture
 5. 別チャンネル・親チャンネルの会話がスレッド内の文脈へ混入しない。
 6. 同じチャンネルでの連続呼び出し、長文、権限不足、再起動後の会話継続を確認する。
 7. Web管理画面を有効にした場合：ログイン後のCookieが `__Host-session`（Secure・HttpOnly・SameSite=Lax）であること、ブラウザーの開発者ツールのコンソールにCSP違反が出ないこと、「サーバー管理」権限のないアカウントにはロール設定が表示されないこと、Web画面で保存したロールで `/talk` が使えること、Discordでロールを外すと60秒以内にWeb画面の権限からも外れること、ログアウト後に `/api/me` が401になること。
-8. ナレッジベースを有効にした場合：日本語の PDF を登録してプレビューが文字化けしていないこと、上限を超えるファイル・同じファイルの再登録で理由が表示されること、利用ロールだけの人には「ナレッジ」タブが表示されないこと、`/talk` の回答末尾に「参照したナレッジ資料:」と資料名が表示されること、`knowledge:false` で参照しないこと、取り込み中に Bot を再起動しても続きから処理されること、Gemini のキーを無効にすると OpenAI に切り替わること、PDF の処理中のメモリ（`docker stats`）。
+8. Webチャット：回答が少しずつ表示されること、停止ボタンで途中までの回答が残ること、生成中にタブを閉じると生成も止まり（再度開くと「停止」で保存されている）、2つ目のタブからの送信は「作成中です」になること、`/talk` と合わせて4件を超えると「混み合っています」になること、XSS（`<img src=x onerror=alert(1)>` や `[x](javascript:alert(1))` を回答させても画像・スクリプトとして働かない）、開発者ツールのコンソールにCSP違反が出ないこと、利用ロールを外すと60秒以内に送信できなくなること。
+9. ナレッジベースを有効にした場合：日本語の PDF を登録してプレビューが文字化けしていないこと、上限を超えるファイル・同じファイルの再登録で理由が表示されること、利用ロールだけの人には「ナレッジ」タブが表示されないこと、`/talk` の回答末尾に「参照したナレッジ資料:」と資料名が表示されること、`knowledge:false` で参照しないこと、取り込み中に Bot を再起動しても続きから処理されること、Gemini のキーを無効にすると OpenAI に切り替わること、PDF の処理中のメモリ（`docker stats`）。
 
 ## 更新・バックアップ
 
