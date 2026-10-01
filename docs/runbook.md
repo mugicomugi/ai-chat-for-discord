@@ -243,46 +243,78 @@ docker compose -f compose.test.yaml -p discussion-bot-test up -d --wait
 docker compose -f compose.test.yaml -p discussion-bot-test exec -T db-test sh -c 'MYSQL_PWD=test_only_root_password mariadb -uroot discussion_test' < restore.sql
 ```
 
-**本番への復元**（Bot は止めておく）: 手元で復号したものを、ssh 経由で流し込みます。
+**本番への復元**は次の順に行います。
 
-```bash
-age -d -i discussion-backup-identity.txt discussion-XXXX.sql.zst.age | zstd -d \
-  | ssh <vm> 'cd ai-chat-for-discord && sudo docker compose exec -T db sh -c '\''MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE"'\'''
-```
-
-**復元した後は**、Bot を起動する前に次の 2 つを行います。
-
-1. 「6. 削除依頼への対応」の台帳にある削除を、もう一度すべて適用する（`kb_document=<ID>` と書いた行は、その資料の削除も）。
-2. Web 管理画面のログインをすべて消す（バックアップの時点で有効だったセッションが復活し、その後にログアウトしたものや、漏えいのため全員をログアウトさせたものも再び使えてしまうため）。利用者はもう一度ログインすれば使えます。
+1. **削除台帳を書き出す**（今の DB が読める場合）。利用者が `/privacy delete` などで削除した記録（ユーザー ID と日時）は DB の `privacy_erasures` に 40 日（バックアップの最長 35 日より長い）残っています。復元するとバックアップ時点の台帳に戻ってしまうので、先に書き出しておきます。中身はユーザー ID なので、root だけが読める場所に置きます。
 
    ```bash
-   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM web_sessions"'
+   sudo sh -c 'umask 077 && docker compose exec -T bot /app/bot ops privacy ledger export > /root/erasures-$(date -u +%F).tsv'
    ```
+
+   DB が読めない（ディスクの故障など）場合は書き出せないので飛ばします。このとき、最後のバックアップより後の削除は適用し直せません（復元したバックアップに入っている台帳の分は、すでにバックアップに反映されています）。
+
+2. **Bot を止めて復元する**: 手元で復号したものを、ssh 経由で流し込みます。
+
+   ```bash
+   ssh <vm> 'cd ai-chat-for-discord && sudo docker compose stop bot'
+   age -d -i discussion-backup-identity.txt discussion-XXXX.sql.zst.age | zstd -d \
+     | ssh <vm> 'cd ai-chat-for-discord && sudo docker compose exec -T db sh -c '\''MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE"'\'''
+   ```
+
+3. **Bot を起動する前に**、次の 2 つを行います。
+
+   1. 削除台帳を適用し直す。Bot は止めたままなので、`exec` ではなく `run` で一時的なコンテナを使います（このコマンドだけはマイグレーションも行うので、台帳の表がない古いバックアップでも動きます）。台帳の各利用者について、削除した日時までに作られたデータを削除・匿名化し直します（その後に作られたデータは残します）。何度実行しても結果は同じです。
+
+      ```bash
+      sudo sh -c 'docker compose run --rm --no-deps -T bot ops privacy ledger apply - < /root/erasures-<日付>.tsv'
+      # 「6. 削除依頼への対応」の資料の削除の記録（と M5 より前の旧台帳）があれば、それも
+      sudo sh -c 'docker compose run --rm --no-deps -T bot ops privacy ledger apply - < /etc/discussion-bot/erasures.log'
+      ```
+
+   2. Web 管理画面のログインをすべて消す（バックアップの時点で有効だったセッションが復活し、その後にログアウトしたものや、漏えいのため全員をログアウトさせたものも再び使えてしまうため）。利用者はもう一度ログインすれば使えます。
+
+      ```bash
+      sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM web_sessions"'
+      ```
+
+4. `sudo docker compose up -d bot` で起動する。書き出した台帳のファイルは、復元が済んだら削除します（`sudo rm /root/erasures-<日付>.tsv`）。
 
 ## 6. 削除依頼への対応
 
-利用者から自分のデータの削除を依頼されたときの手順です（M5「プライバシー・運用の仕上げ」で `/privacy` コマンドによるセルフサービスに置き換えます）。
+利用者は、自分のデータを自分で削除できます（README の「自分のデータの確認と削除」）。
+
+- Discord: `/privacy show` で件数を確認し、`/privacy delete` の確認ボタンで削除する。許可リストやロールに関係なく使えます。
+- Web: 画面上部の「あなたのデータ」（`https://<ドメイン>/#/privacy`）。ログインできれば、サーバーの権限がなくても使えます。
+
+削除するのは `/talk` の記録（返信の記録を含む）・Web チャットの会話（メッセージを含む）・Web のログインで、ナレッジ資料とロール設定は資料・設定を残して登録者（設定者）の ID と名前だけを消します。生成中の Web チャットの回答は止まり、保存されません。回答を作成中の `/talk` の記録だけは残るので、その場合は少し待ってからもう一度削除してもらいます。削除はログ `privacy_erased`（件数だけ）に出て、DB の台帳（`privacy_erasures`、40 日で自動削除）に記録されます。台帳は「5. バックアップと復元」で使います。
+
+**運営者が代わりに削除するとき**（Discord もログインも使えない人からの依頼など）
 
 1. 依頼者の Discord ユーザー ID を確認する。
-2. 削除する（回答の投稿記録 `talk_replies` と Web チャットのメッセージ `web_messages` は外部キーで一緒に消えます。`web_sessions` は Web 管理画面のログイン情報で、消すとその人はログアウトします）。生成中の Web チャットの回答があれば、保存先が消えるので保存されずに終わります。
+2. 削除する（`/privacy delete` と同じ処理で、台帳にも記録されます）。
 
    ```bash
-   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM talk_runs WHERE user_id = <USER_ID>; DELETE FROM web_conversations WHERE user_id = <USER_ID>; DELETE FROM web_sessions WHERE user_id = <USER_ID>; UPDATE kb_documents SET uploaded_by = NULL, uploaded_by_name = NULL WHERE uploaded_by = <USER_ID>"'
+   sudo docker compose exec bot /app/bot ops privacy erase <USER_ID>
    ```
 
-   Web チャットの会話は、本人も画面からいつでも削除できます。
-
-   ナレッジ資料はサーバーのもの（そのサーバーのナレッジ管理者が管理）なので、資料そのものは消さず、登録者の ID と名前だけを消します。資料の内容に依頼者の個人情報が含まれている場合は、そのサーバーのナレッジ管理者に資料の削除を依頼するか、運営者が `DELETE FROM kb_documents WHERE id = <ID>` で削除します（チャンクとベクトルも一緒に消えます）。
-
-3. バックアップからの復元に備えて、台帳に記録する（root だけが読めるファイル）。依頼のために運営者が資料を削除した場合は、その資料の ID も同じ行に書きます（復元すると資料も戻るため）。
+3. ナレッジ資料の内容に依頼者の個人情報が含まれている場合は、そのサーバーのナレッジ管理者に資料の削除を依頼するか、運営者が削除します（チャンクとベクトルも一緒に消えます）。運営者が削除した資料は台帳に入らないので、復元に備えて資料 ID を root だけが読めるファイルに控えます（「5. バックアップと復元」で一緒に適用されます）。
 
    ```bash
-   echo "$(date -u +%F) <USER_ID>" | sudo tee -a /etc/discussion-bot/erasures.log >/dev/null
-   # 資料も削除した場合
-   echo "$(date -u +%F) <USER_ID> kb_document=<ID>" | sudo tee -a /etc/discussion-bot/erasures.log >/dev/null
+   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM kb_documents WHERE id = <ID>"'
+   echo "$(date -u +%F) kb_document=<ID>" | sudo tee -a /etc/discussion-bot/erasures.log >/dev/null
    ```
 
-4. 依頼者に完了を伝える。バックアップには最長 35 日残ることも伝える。
+4. 依頼者に完了を伝える。バックアップには最長 35 日残り、復元した場合も削除し直すことも伝える。
+
+### M5 を初めてデプロイしたとき（一度だけ）
+
+M5 より前は、削除した利用者を `/etc/discussion-bot/erasures.log` に手で記録していました（`<日付> <USER_ID>` と `kb_document=<ID>`）。デプロイ後に一度だけ適用し、利用者の分を DB の台帳へ移します。各利用者について、記録した日の終わりまでに作られたデータだけを削除し直すので、その後にまた使い始めた人のデータは消えません。
+
+```bash
+sudo sh -c 'docker compose exec -T bot /app/bot ops privacy ledger apply - < /etc/discussion-bot/erasures.log'
+```
+
+以後、利用者の削除をこのファイルに書く必要はありません。ファイルは、運営者が削除した資料の記録（上の 3.）のために残します。40 日より古い利用者の行は、台帳に移っても次の 1 時間ごとの処理で消えます（35 日より古いバックアップはないため、もう必要ありません）。
 
 ## 7. Discord Developer Portal
 
@@ -328,10 +360,24 @@ ops guild role list <GUILD_ID>               # 設定済みのロール
 ops guild role add <GUILD_ID> use <ROLE_ID>       # 利用ロールを追加
 ops guild role add <GUILD_ID> manage <ROLE_ID>    # ナレッジ管理ロールを追加
 ops guild role remove <GUILD_ID> use <ROLE_ID>    # 外す
+ops guild purge <GUILD_ID> [--force]         # Bot が外されたサーバーのデータを今すぐ削除（下記）
 ops kb prune-embeddings [--apply]            # 今の設定にないモデルのベクトルを削除（「13-5」）
+ops privacy erase <USER_ID>                  # 利用者のデータを削除（「6. 削除依頼への対応」）
+ops privacy ledger export                    # 削除台帳を書き出す（「5. バックアップと復元」）
 ```
 
+`ops privacy ledger apply -` は標準入力から読むので、`ops` 関数ではなく `sudo docker compose exec -T bot /app/bot ops …` の形で使います（「5. バックアップと復元」）。
+
 - 種類ごとに最大 25 ロールです。Discord で削除したロールは自動で設定から外れます。
+- `ops guild list` の名前の後ろの `[bot left <日付>]` は、Bot がそのサーバーから外された日です。
+
+### Bot がサーバーから外されたとき
+
+Bot がサーバーから外される（キックされる、サーバーが削除される）と、その日時を `guilds.left_at` に記録します（ログ `guild_left`。Bot が止まっている間に外された場合は、次に Discord へ接続したときに `guild_left_while_offline`）。
+
+- **猶予**: `GUILD_PURGE_GRACE_DAYS`（既定 14 日、1〜365）の間は何も消しません。猶予中に再び招待されれば記録が消え（ログ `guild_rejoined`）、許可リスト・ロール設定・ナレッジ資料はそのまま使えます。
+- **削除**: 猶予を過ぎると、1 時間ごとの処理（起動直後の 1 回を除く）がそのサーバーの `/talk` の記録・Web チャットの会話・ナレッジ資料（チャンクとベクトルを含む）・ロール設定を削除し、許可リストからも外します（ログ `left_guild_purged`。`guilds` の行は `purged <日付> after the bot left` というメモ付きで残ります）。その後に招待し直したときは、「8. サーバー（ギルド）を追加する」の 3. からやり直します。バックアップには最長 35 日残ります。
+- **すぐに消す**: 猶予を待たずに消すときは `ops guild purge <GUILD_ID>`。Bot がまだ参加しているサーバーは、`--force` を付けない限り拒否します（`--force` で消した場合も許可リストから外れます）。
 - ロールの設定を変えられるのは、`/config` ではサーバーのオーナーと「管理者」「サーバー管理」権限を持つ人だけです（ナレッジ管理ロールでは変更できません）。
 
 ### M1 を初めてデプロイしたとき（一度だけ）
@@ -525,11 +571,7 @@ ops kb prune-embeddings --apply     # 今の EMBEDDING_PROVIDERS にないキー
 
 ### 13-6. Bot がサーバーから外されたとき
 
-自動で資料を消す仕組みは M5 で追加します。それまでは、サーバーから外された（再び招待されない）ことを確かめてから、そのサーバーの資料を運営者が削除します（チャンクとベクトルも一緒に消えます。バックアップには最長 35 日残ります）。
-
-```bash
-sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM kb_documents WHERE guild_id = <GUILD_ID>"'
-```
+資料は、そのサーバーの他のデータと一緒に `GUILD_PURGE_GRACE_DAYS`（既定 14 日）の猶予の後で自動的に削除されます（チャンクとベクトルも一緒に消えます）。猶予を待たずに消すときは `ops guild purge <GUILD_ID>` です（「8. サーバー（ギルド）を追加する」の「Bot がサーバーから外されたとき」）。
 
 ### 13-7. 容量の上限
 

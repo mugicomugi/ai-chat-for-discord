@@ -108,6 +108,8 @@ jobs:
       # Uses the vectors knowledge_vectors leaves behind; backups depend on this (scripts/backup.sh).
       - name: VECTOR backup round trip (mariadb-dump --hex-blob)
         run: scripts/check-vector-dump.sh
+      - name: Privacy erasure and guild purge test
+        run: cargo test --locked --test web privacy_and_guild_purge -- --ignored --exact
 
   # The production VM (1 GB) compiles the image itself with one job: report the peak memory of
   # such a build, so new dependencies (pdf-extract and lopdf in M3) can be judged before merging.

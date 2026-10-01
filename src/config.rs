@@ -14,6 +14,8 @@ pub struct Config {
     pub db_password: String,
     pub retention_days: i64,
     pub request_timeout: Duration,
+    /// Days after the bot is removed from a guild before that guild's data is purged.
+    pub guild_purge_grace_days: i64,
     /// The web UI; `None` when none of its variables are set.
     pub web: Option<WebConfig>,
     /// The knowledge base; `None` when EMBEDDING_PROVIDERS is empty.
@@ -40,6 +42,7 @@ pub struct WebConfig {
 pub const DEFAULT_WEB_BIND: &str = "0.0.0.0:8080";
 pub const DEFAULT_DAILY_MESSAGES: u32 = 100;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+pub const DEFAULT_GUILD_PURGE_GRACE_DAYS: i64 = 14;
 const DISCORD_API: &str = "https://discord.com/api/v10";
 
 impl WebConfig {
@@ -436,10 +439,26 @@ impl Config {
             db_password: required("MARIADB_PASSWORD")?,
             retention_days,
             request_timeout,
+            guild_purge_grace_days: guild_purge_grace_days(
+                env::var("GUILD_PURGE_GRACE_DAYS").ok(),
+            )?,
             web,
             kb: KbConfig::from_lookup(|name| env::var(name).ok())?,
         })
     }
+}
+
+/// GUILD_PURGE_GRACE_DAYS: 1 to 365, empty or unset for the default (compose.yaml passes
+/// `${VAR:-}` through).
+fn guild_purge_grace_days(value: Option<String>) -> Result<i64> {
+    let value = value.filter(|v| !v.trim().is_empty());
+    ranged(
+        &|_: &str| value.clone(),
+        "GUILD_PURGE_GRACE_DAYS",
+        DEFAULT_GUILD_PURGE_GRACE_DAYS,
+        1,
+        365,
+    )
 }
 
 fn required(name: &str) -> Result<String> {
@@ -524,6 +543,19 @@ mod tests {
         assert_eq!(daily(" 20 ").unwrap().unwrap().daily_messages, 20);
         for bad in ["0", "-1", "abc", "100001"] {
             assert!(daily(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_guild_purge_grace_period_is_bounded() {
+        let days = |value: Option<&str>| guild_purge_grace_days(value.map(String::from));
+        assert_eq!(days(None).unwrap(), 14);
+        assert_eq!(days(Some("")).unwrap(), 14);
+        assert_eq!(days(Some(" 30 ")).unwrap(), 30);
+        assert_eq!(days(Some("1")).unwrap(), 1);
+        assert_eq!(days(Some("365")).unwrap(), 365);
+        for bad in ["0", "-1", "366", "2w", "1.5"] {
+            assert!(days(Some(bad)).is_err(), "{bad}");
         }
     }
 

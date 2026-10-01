@@ -5,7 +5,10 @@
 //! ```
 //!
 //! They use the database and the bot token's REST access, never the gateway, and never run
-//! migrations (the running bot already did).
+//! migrations (the running bot already did), except `privacy ledger apply`: it is also run with
+//! the bot stopped, right after a backup was restored, possibly one older than the ledger table.
+
+use std::io::Read;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serenity::{
@@ -18,6 +21,7 @@ use crate::{
     config::Config,
     db::{Database, RoleChange},
     ids::parse_snowflake,
+    privacy::{self, LEDGER_DAYS},
 };
 
 pub const USAGE: &str = "usage:
@@ -27,8 +31,12 @@ pub const USAGE: &str = "usage:
   ops guild role list <GUILD_ID>
   ops guild role add <GUILD_ID> <use|manage> <ROLE_ID>
   ops guild role remove <GUILD_ID> <use|manage> <ROLE_ID>
+  ops guild purge <GUILD_ID> [--force]
   ops kb prune-embeddings [--apply]
-(a ROLE_ID equal to the GUILD_ID is @everyone)";
+  ops privacy erase <USER_ID>
+  ops privacy ledger export
+  ops privacy ledger apply <FILE|->
+(a ROLE_ID equal to the GUILD_ID is @everyone; `-` reads standard input)";
 
 /// Vectors deleted per statement by `kb prune-embeddings`.
 const PRUNE_BATCH: u32 = 5_000;
@@ -43,8 +51,13 @@ pub async fn run(args: &[String]) -> Result<()> {
             | ["guild", "deny", _]
             | ["guild", "role", "list", _]
             | ["guild", "role", "add" | "remove", _, _, _]
+            | ["guild", "purge", _]
+            | ["guild", "purge", _, "--force"]
             | ["kb", "prune-embeddings"]
             | ["kb", "prune-embeddings", "--apply"]
+            | ["privacy", "erase", _]
+            | ["privacy", "ledger", "export"]
+            | ["privacy", "ledger", "apply", _]
     ) {
         bail!("{USAGE}");
     }
@@ -65,6 +78,45 @@ pub async fn run(args: &[String]) -> Result<()> {
                 .map(|_| ())
         }
         ["guild", "list"] => list_guilds(&db, &http).await,
+        ["guild", "purge", guild, rest @ ..] => {
+            purge_guild(&db, snowflake(guild, "GUILD_ID")?, rest == ["--force"]).await
+        }
+        ["privacy", "erase", user] => {
+            let user = snowflake(user, "USER_ID")?;
+            // The running bot's web answer of this user, if any, finds nothing left to save.
+            let erasure = privacy::erase_user(&db, None, user)
+                .await
+                .context("erasing the user's data failed; nothing was changed")?;
+            println!(
+                "erased user {user}: {} /talk records, {} web conversations, {} web sessions deleted; \
+                 {} knowledge documents and {} role settings anonymized",
+                erasure.talk_runs,
+                erasure.web_conversations,
+                erasure.web_sessions,
+                erasure.kb_documents,
+                erasure.guild_roles
+            );
+            if erasure.talk_runs_in_progress > 0 {
+                println!(
+                    "note: {} /talk records were still being answered and were kept; run this again in a few minutes",
+                    erasure.talk_runs_in_progress
+                );
+            }
+            Ok(())
+        }
+        ["privacy", "ledger", "export"] => {
+            let ledger = db
+                .erasure_ledger()
+                .await
+                .context("reading the erasure ledger failed")?;
+            print!("{}", privacy::format_ledger(&ledger));
+            eprintln!(
+                "{} erasures (kept {LEDGER_DAYS} days); store this file where only root can read it",
+                ledger.len()
+            );
+            Ok(())
+        }
+        ["privacy", "ledger", "apply", source] => apply_ledger(&db, source).await,
         ["guild", "allow", guild, note @ ..] => {
             let guild = snowflake(guild, "GUILD_ID")?;
             let note = note.join(" ");
@@ -236,6 +288,60 @@ pub async fn prune_embeddings(
     Ok(total)
 }
 
+/// Purges a guild's data now instead of after GUILD_PURGE_GRACE_DAYS. Refuses a guild the bot
+/// has not left unless `force`.
+async fn purge_guild(db: &Database, guild: u64, force: bool) -> Result<()> {
+    let row = db
+        .guilds()
+        .await?
+        .into_iter()
+        .find(|row| row.guild_id == guild);
+    if row.as_ref().and_then(|row| row.left_at).is_none() && !force {
+        bail!(
+            "the bot has not left guild {guild} (no left_at recorded); remove the bot from the \
+             guild first, or pass --force to purge its data while the bot stays"
+        );
+    }
+    let purged = db
+        .purge_guild(guild)
+        .await
+        .context("purging the guild failed; run the command again")?;
+    println!(
+        "purged guild {guild}: {} /talk records, {} web conversations, {} knowledge documents, {} role settings",
+        purged.talk_runs, purged.web_conversations, purged.kb_documents, purged.guild_roles
+    );
+    println!("the guild is no longer allowed; `ops guild allow {guild}` lets it use the bot again");
+    Ok(())
+}
+
+/// Erases every user of a ledger again (after restoring a backup). Reads the file, or standard
+/// input for `-`.
+async fn apply_ledger(db: &Database, source: &str) -> Result<()> {
+    let text = if source == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .context("reading standard input failed")?;
+        text
+    } else {
+        std::fs::read_to_string(source).with_context(|| format!("reading {source} failed"))?
+    };
+    let entries =
+        privacy::parse_ledger(&text).map_err(|error| anyhow!("invalid ledger: {error}"))?;
+    db.migrate().await.map_err(|error| {
+        let (kind, version) = crate::db::migrate_error_summary(&error);
+        anyhow!("database migration failed ({kind}, version {version:?})")
+    })?;
+    let applied = privacy::apply_ledger(db, &entries)
+        .await
+        .context("applying the ledger failed; it is safe to run the command again")?;
+    println!(
+        "applied {} erasures ({} rows deleted or anonymized again) and deleted {} knowledge documents",
+        applied.users, applied.rows, applied.kb_documents
+    );
+    Ok(())
+}
+
 async fn list_guilds(db: &Database, http: &Http) -> Result<()> {
     let rows = db.guilds().await?;
     let joined = joined_guilds(http).await;
@@ -254,7 +360,7 @@ async fn list_guilds(db: &Database, http: &Http) -> Result<()> {
         };
         let info = joined.iter().find(|guild| guild.id.get() == row.guild_id);
         println!(
-            "{:<20}  {:<11}  {:<8}  {}{}",
+            "{:<20}  {:<11}  {:<8}  {}{}{}",
             row.guild_id,
             status,
             if info.is_some() { "yes" } else { "no" },
@@ -262,6 +368,9 @@ async fn list_guilds(db: &Database, http: &Http) -> Result<()> {
             row.note
                 .as_deref()
                 .map(|note| format!(" ({note})"))
+                .unwrap_or_default(),
+            row.left_at
+                .map(|at| format!(" [bot left {}]", at.format("%Y-%m-%d")))
                 .unwrap_or_default()
         );
     }
@@ -358,9 +467,15 @@ mod tests {
             vec![],
             vec!["guild"],
             vec!["guild", "role", "add", "1", "use"],
-            vec!["guild", "purge", "1"],
+            vec!["guild", "purge"],
+            vec!["guild", "purge", "1", "--yes"],
             vec!["kb", "prune-embeddings", "--force"],
             vec!["kb"],
+            vec!["privacy"],
+            vec!["privacy", "erase"],
+            vec!["privacy", "ledger"],
+            vec!["privacy", "ledger", "import", "-"],
+            vec!["privacy", "ledger", "apply"],
         ] {
             let args: Vec<String> = args.into_iter().map(String::from).collect();
             let error = run(&args).await.unwrap_err().to_string();

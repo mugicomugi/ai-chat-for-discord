@@ -4,6 +4,7 @@
 //
 // Screens are registered in `routes`; pages of a server are registered in `guildTabs` with the
 // right they need. The chat (`#/chat/...`) is a screen of its own with a full-height layout.
+// `#/privacy` shows the user's own data and erases it.
 
 const MAX_ROLES_PER_KIND = 25;
 
@@ -122,11 +123,13 @@ export const guildTabs = [
 
 const GUILD_PATH = /^\/guilds\/(\d{1,20})(?:\/([a-z-]+))?$/;
 const CHAT_PATH = /^\/chat(?:\/(\d{1,20})(?:\/(\d{1,20}))?)?$/;
+const PRIVACY_PATH = /^\/privacy$/;
 
 export const routes = [
   { path: /^\/$/, refresh: true, view: homeView },
   { path: GUILD_PATH, view: guildView },
   { path: CHAT_PATH, view: chatView },
+  { path: PRIVACY_PATH, view: privacyView },
 ];
 
 /** Guilds where the user may use the bot (and so the chat). */
@@ -140,7 +143,7 @@ function chatGuilds() {
 const RETURN_KEY = "return-to";
 
 function returnable(path) {
-  return GUILD_PATH.test(path) || CHAT_PATH.test(path);
+  return GUILD_PATH.test(path) || CHAT_PATH.test(path) || PRIVACY_PATH.test(path);
 }
 
 function rememberReturn() {
@@ -216,6 +219,7 @@ function renderAccount() {
   account.replaceChildren(
     h("a", { href: "#/" }, "サーバー"),
     chatGuilds().length > 0 && h("a", { href: "#/chat" }, "チャット"),
+    h("a", { href: "#/privacy" }, "あなたのデータ"),
     h("span", { class: "user" }, me.user.name),
     h("button", { type: "button", class: "link", onclick: logout }, "ログアウト"),
   );
@@ -268,6 +272,118 @@ function errorView(error) {
     { class: "error" },
     h("p", { class: "status error" }, message),
     h("p", {}, h("button", { type: "button", onclick: () => render() }, "再読み込み")),
+  );
+}
+
+// The user's own data: counts, then erasure behind a confirmation step. The server erases the
+// web sessions too, so a successful erasure ends with the user logged out.
+async function privacyView() {
+  return privacyScreen(await api("GET", "/api/privacy"));
+}
+
+function privacyScreen(data) {
+  const rows = [
+    ["/talk の記録（質問と回答）", data.talk_runs],
+    ["Web チャットの会話", data.web_conversations],
+    ["Web のログイン（この画面を含む）", data.web_sessions],
+    ["登録者としてあなたの ID と名前が記録されたナレッジ資料", data.kb_documents],
+    ["設定者としてあなたの ID が記録されたロール設定", data.guild_roles],
+  ];
+  const status = h("p", { class: "status", role: "status" });
+  const agree = h("input", { type: "checkbox" });
+  const erase = h("button", { type: "button", class: "danger", disabled: true }, "削除する");
+  const start = h("button", { type: "button", class: "danger" }, "データを削除する…");
+  const cancel = h("button", { type: "button" }, "やめる");
+  const confirmPanel = h(
+    "div",
+    { class: "confirm", hidden: true },
+    h("p", {}, "削除すると元に戻せません。削除の後は、この画面からもログアウトされます。"),
+    h("label", {}, agree, "上の内容を確認し、削除することに同意します"),
+    h("div", { class: "actions" }, erase, cancel, status),
+  );
+  agree.addEventListener("change", () => {
+    erase.disabled = !agree.checked;
+  });
+  start.addEventListener("click", () => {
+    start.hidden = true;
+    confirmPanel.hidden = false;
+  });
+  cancel.addEventListener("click", () => {
+    agree.checked = false;
+    erase.disabled = true;
+    status.textContent = "";
+    confirmPanel.hidden = true;
+    start.hidden = false;
+  });
+  erase.addEventListener("click", async () => {
+    erase.disabled = true;
+    cancel.disabled = true;
+    status.className = "status";
+    status.textContent = "削除しています…";
+    try {
+      const result = await api("POST", "/api/privacy/delete", { confirm: "DELETE" });
+      session.me = null;
+      renderAccount();
+      root.replaceChildren(erasedView(result));
+    } catch (error) {
+      if (error.status === 401) {
+        render();
+        return;
+      }
+      status.className = "status error";
+      status.textContent = error.message;
+      erase.disabled = !agree.checked;
+      cancel.disabled = false;
+    }
+  });
+  return h(
+    "section",
+    { class: "privacy" },
+    h("h1", {}, "あなたのデータ"),
+    h("p", { class: "muted" }, "このBotが保存している、あなたに関するデータの件数です（すべてのサーバーの合計）。"),
+    h(
+      "table",
+      { class: "counts" },
+      h(
+        "tbody",
+        {},
+        rows.map(([label, count]) => h("tr", {}, h("th", { scope: "row" }, label), h("td", {}, `${formatNumber(count)} 件`))),
+      ),
+    ),
+    h("h2", {}, "データの削除"),
+    h(
+      "ul",
+      {},
+      h("li", {}, "/talk の記録、Web チャットの会話（メッセージを含む）、Web のログインを削除します。"),
+      h("li", {}, "ナレッジ資料とロール設定はサーバーのものなので残し、記録されたあなたの ID と名前だけを消します。"),
+      h("li", {}, "回答を作成中の /talk の記録は残ります。回答が終わってから、もう一度削除してください。"),
+      h("li", {}, "Discord のチャンネルに投稿された回答のメッセージは削除されません。"),
+      h("li", {}, "バックアップには最長 35 日残りますが、バックアップから復元した場合も削除し直します。"),
+    ),
+    h("p", { class: "muted" }, "Discord の /privacy delete でも同じ削除ができます。詳しくは", h("a", { href: "/privacy" }, "プライバシーポリシー"), "をご覧ください。"),
+    h("div", { class: "actions" }, start),
+    confirmPanel,
+  );
+}
+
+function erasedView(result) {
+  return h(
+    "section",
+    { class: "privacy" },
+    h("h1", {}, "削除しました"),
+    h(
+      "p",
+      {},
+      `/talk の記録 ${formatNumber(result.talk_runs)} 件、Web チャットの会話 ${formatNumber(result.web_conversations)} 件、Web のログイン ${formatNumber(result.web_sessions)} 件を削除し、ナレッジ資料 ${formatNumber(result.kb_documents)} 件とロール設定 ${formatNumber(result.guild_roles)} 件からあなたの ID と名前を消しました。`,
+    ),
+    result.talk_runs_in_progress > 0 &&
+      h(
+        "p",
+        { class: "status warn" },
+        `回答を作成中の /talk の記録 ${formatNumber(result.talk_runs_in_progress)} 件は残っています。回答が終わってから、もう一度削除してください。`,
+      ),
+    h("p", {}, "ログアウトしました。"),
+    h("p", {}, h("a", { class: "button", href: "#/" }, "トップへ")),
   );
 }
 

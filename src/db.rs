@@ -468,7 +468,7 @@ impl Database {
 /// guild_roles takes no gap locks, so it neither blocks a save into a guild without roles nor
 /// sees rows another save inserted meanwhile. Lock order: the guilds row, then guild_roles. A
 /// guild without a row (`ops` before `allow`) has nothing to lock; only the operator writes it.
-async fn lock_guild(
+pub(crate) async fn lock_guild(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     guild: u64,
 ) -> Result<(), sqlx::Error> {

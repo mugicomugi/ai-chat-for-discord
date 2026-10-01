@@ -13,7 +13,8 @@ use discord_discussion_bot::{
     knowledge::{self, Knowledge, worker::Timing},
     limits::Limits,
     ops,
-    web::{self, BotGuilds, authz::DiscordCache},
+    privacy::LEDGER_DAYS,
+    web::{self, BotGuilds, authz::DiscordCache, chat::Chat},
 };
 use serenity::all::{Client, GatewayIntents};
 use tokio::sync::watch;
@@ -101,6 +102,7 @@ async fn run() -> Result<()> {
     };
     let bot_guilds = BotGuilds::default();
     let discord_cache = Arc::new(DiscordCache::default());
+    let chat = Arc::new(Chat::default());
     let handler = Handler {
         config: config.clone(),
         db: db.clone(),
@@ -110,6 +112,7 @@ async fn run() -> Result<()> {
         bot_guilds: bot_guilds.clone(),
         discord_cache: discord_cache.clone(),
         knowledge: knowledge.clone(),
+        chat: chat.clone(),
     };
     let mut client = Client::builder(
         &config.discord_token,
@@ -134,10 +137,11 @@ async fn run() -> Result<()> {
                 limits,
                 // The bot's own REST client, so the web shares its rate-limit state.
                 http: client.http.clone(),
-                bot_guilds,
+                bot_guilds: bot_guilds.clone(),
                 discord_ready: discord_ready.clone(),
                 discord_cache,
                 knowledge: knowledge.clone(),
+                chat,
             },
         )
         .context("HTTP client initialization failed")?;
@@ -152,7 +156,13 @@ async fn run() -> Result<()> {
     let worker = knowledge
         .as_ref()
         .map(|knowledge| knowledge.spawn_worker(Timing::default(), stopped.clone()));
-    let maintenance = tokio::spawn(maintenance(db, config.retention_days, stopped));
+    let maintenance = tokio::spawn(maintenance(
+        db,
+        config.retention_days,
+        config.guild_purge_grace_days,
+        bot_guilds,
+        stopped,
+    ));
     let manager = client.shard_manager.clone();
     let result = tokio::select! {
         result = client.start() => result.map_err(|_| anyhow::anyhow!("Discord connection stopped; check token, intents and network")),
@@ -186,10 +196,18 @@ async fn run() -> Result<()> {
     result
 }
 
-/// Hourly: retention of /talk records and web chat conversations (by their last update), and
-/// expired web sessions. Runs once at startup too.
-async fn maintenance(db: Database, retention_days: i64, mut stop: watch::Receiver<bool>) {
+/// Hourly: retention of /talk records and web chat conversations (by their last update),
+/// expired web sessions, old entries of the erasure ledger, and the data of guilds the bot left
+/// more than `grace_days` ago. Runs once at startup too, except for the guild purge.
+async fn maintenance(
+    db: Database,
+    retention_days: i64,
+    grace_days: i64,
+    bot_guilds: BotGuilds,
+    mut stop: watch::Receiver<bool>,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    let mut startup = true;
     loop {
         tokio::select! {
             _ = interval.tick() => {}
@@ -210,6 +228,50 @@ async fn maintenance(db: Database, retention_days: i64, mut stop: watch::Receive
         match db.purge_sessions(now).await {
             Ok(deleted) => tracing::info!(deleted, "session_cleanup"),
             Err(_) => tracing::warn!("session_cleanup_failed"),
+        }
+        match db
+            .purge_erasures(now - chrono::Duration::days(LEDGER_DAYS))
+            .await
+        {
+            Ok(deleted) => tracing::info!(deleted, "erasure_ledger_cleanup"),
+            Err(_) => tracing::warn!("erasure_ledger_cleanup_failed"),
+        }
+        // Not at startup: a guild that invited the bot again while it was offline is only
+        // known once its GUILD_CREATE arrives.
+        if !std::mem::replace(&mut startup, false) {
+            purge_left_guilds(&db, now - chrono::Duration::days(grace_days), &bot_guilds).await;
+        }
+    }
+}
+
+async fn purge_left_guilds(db: &Database, cutoff: chrono::DateTime<Utc>, bot_guilds: &BotGuilds) {
+    let guilds = match db.guilds_to_purge(cutoff).await {
+        Ok(guilds) => guilds,
+        Err(_) => {
+            tracing::warn!("guild_purge_failed");
+            return;
+        }
+    };
+    for guild_id in guilds {
+        // A missed GUILD_CREATE would leave left_at set; the gateway knows better.
+        if bot_guilds
+            .read()
+            .expect("bot guild lock poisoned")
+            .contains(&guild_id)
+        {
+            tracing::warn!(guild_id, "guild_purge_skipped_bot_present");
+            continue;
+        }
+        match db.purge_guild(guild_id).await {
+            Ok(purged) => tracing::info!(
+                guild_id,
+                talk_runs = purged.talk_runs,
+                web_conversations = purged.web_conversations,
+                kb_documents = purged.kb_documents,
+                guild_roles = purged.guild_roles,
+                "left_guild_purged"
+            ),
+            Err(_) => tracing::warn!(guild_id, "guild_purge_failed"),
         }
     }
 }

@@ -10,4 +10,5 @@ pub mod knowledge;
 pub mod limits;
 pub mod ops;
 pub mod output;
+pub mod privacy;
 pub mod web;

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,7 +20,8 @@ use crate::{
     knowledge::{Knowledge, consult},
     limits::{Busy, Key, Limits},
     output::split_message,
-    web::{BotGuilds, authz::DiscordCache},
+    privacy::{self, Erasure, Holdings},
+    web::{BotGuilds, authz::DiscordCache, chat::Chat},
 };
 
 pub struct Handler {
@@ -35,6 +37,8 @@ pub struct Handler {
     pub discord_cache: Arc<DiscordCache>,
     /// `None` when the knowledge base is disabled.
     pub knowledge: Option<Arc<Knowledge>>,
+    /// The web chat's answers being generated, so /privacy delete can stop the user's.
+    pub chat: Arc<Chat>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +169,141 @@ pub fn config_command() -> CreateCommand {
         ))
 }
 
+/// Open to everyone, whatever the guild's allowlist or roles: it only concerns the caller's own
+/// data.
+pub fn privacy_command() -> CreateCommand {
+    CreateCommand::new("privacy")
+        .description("あなたについて保存されているデータの確認と削除")
+        .contexts(vec![InteractionContext::Guild])
+        .integration_types(vec![InstallationContext::Guild])
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "show",
+            "保存されているあなたのデータの件数を表示します",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "delete",
+            "あなたのデータを削除します（確認があります）",
+        ))
+}
+
+/// How long the confirmation button of /privacy delete stays valid.
+const PRIVACY_CONFIRM_SECONDS: i64 = 600;
+const PRIVACY_LOOKUP_FAILED: &str =
+    "データを確認できませんでした。時間をおいて再試行してください。";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivacyButton {
+    Delete,
+    Cancel,
+    /// Pressed after `PRIVACY_CONFIRM_SECONDS`.
+    Expired,
+    /// Pressed by someone other than the user who ran the command.
+    NotYours,
+}
+
+/// The custom ID of a confirmation button: the action, the user who may press it and when it
+/// was issued.
+fn privacy_button_id(delete: bool, user: u64, issued: DateTime<Utc>) -> String {
+    let action = if delete { "delete" } else { "cancel" };
+    format!("privacy:{action}:{user}:{}", issued.timestamp())
+}
+
+/// What pressing the button means for `clicker`; `None` if it is not a /privacy button.
+fn privacy_button(custom_id: &str, clicker: u64, now: DateTime<Utc>) -> Option<PrivacyButton> {
+    let mut parts = custom_id.split(':');
+    if parts.next() != Some("privacy") {
+        return None;
+    }
+    let action = match parts.next()? {
+        "delete" => PrivacyButton::Delete,
+        "cancel" => PrivacyButton::Cancel,
+        _ => return None,
+    };
+    let user = crate::ids::parse_snowflake(parts.next()?)?;
+    let issued: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if user != clicker {
+        return Some(PrivacyButton::NotYours);
+    }
+    let age = now.timestamp() - issued;
+    // A little slack for clock differences between Discord and this host.
+    if action == PrivacyButton::Delete && !(-60..=PRIVACY_CONFIRM_SECONDS).contains(&age) {
+        return Some(PrivacyButton::Expired);
+    }
+    Some(action)
+}
+
+fn describe_holdings(holdings: &Holdings, web: Option<&str>) -> String {
+    let mut text = format!(
+        "**あなたについて保存されているデータ**（すべてのサーバーの合計）\n\
+         /talk の記録（質問と回答）: {} 件\n\
+         Web チャットの会話: {} 件\n\
+         Web のログイン: {} 件",
+        holdings.talk_runs, holdings.web_conversations, holdings.web_sessions
+    );
+    if holdings.kb_documents + holdings.guild_roles > 0 {
+        text.push_str(&format!(
+            "\n登録者・設定者としてあなたの ID が記録されたナレッジ資料 {} 件、ロール設定 {} 件",
+            holdings.kb_documents, holdings.guild_roles
+        ));
+    }
+    text.push_str(
+        "\n\n/talk の記録と Web チャットの会話は、保存期間を過ぎると自動で削除されます。\
+         今すぐ削除するには /privacy delete を実行してください。",
+    );
+    if let Some(origin) = web {
+        text.push_str(&format!(
+            "\nWeb 画面でも確認・削除できます: <{origin}/#/privacy>"
+        ));
+    }
+    text
+}
+
+fn describe_deletion(holdings: &Holdings) -> String {
+    format!(
+        "**データの削除**\n\
+         次のデータを、すべてのサーバーについて削除します。元に戻せません。\n\
+         ・/talk の記録（質問と回答） {} 件\n\
+         ・Web チャットの会話 {} 件（メッセージを含む）\n\
+         ・Web のログイン {} 件（Web 画面からログアウトされます）\n\
+         ・ナレッジ資料 {} 件とロール設定 {} 件に記録された、あなたの ID と名前（資料と設定はサーバーのものなので残ります）\n\
+         チャンネルに投稿された回答のメッセージは Discord に残ります。\n\n\
+         削除するには、{} 分以内に「削除する」を押してください。",
+        holdings.talk_runs,
+        holdings.web_conversations,
+        holdings.web_sessions,
+        holdings.kb_documents,
+        holdings.guild_roles,
+        PRIVACY_CONFIRM_SECONDS / 60
+    )
+}
+
+fn describe_erasure(erasure: &Erasure) -> String {
+    let mut text = format!(
+        "削除しました。/talk の記録 {} 件、Web チャットの会話 {} 件、Web のログイン {} 件を削除し、\
+         ナレッジ資料 {} 件とロール設定 {} 件からあなたの ID と名前を消しました。",
+        erasure.talk_runs,
+        erasure.web_conversations,
+        erasure.web_sessions,
+        erasure.kb_documents,
+        erasure.guild_roles
+    );
+    if erasure.talk_runs_in_progress > 0 {
+        text.push_str(&format!(
+            "\n回答を作成中の /talk の記録 {} 件は残っています。回答が終わってから、もう一度 /privacy delete を実行してください。",
+            erasure.talk_runs_in_progress
+        ));
+    }
+    text.push_str(
+        "\nバックアップには最長 35 日残りますが、バックアップから復元した場合も削除し直します。",
+    );
+    text
+}
+
 pub fn no_mentions() -> CreateAllowedMentions {
     CreateAllowedMentions::new()
         .all_users(false)
@@ -176,16 +315,31 @@ pub fn no_mentions() -> CreateAllowedMentions {
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        // A new session lists every guild the bot is in (as unavailable until GUILD_CREATE).
-        *self.bot_guilds.write().expect("bot guild lock poisoned") =
-            ready.guilds.iter().map(|guild| guild.id.get()).collect();
+        // A new session lists every guild of the shard (as unavailable until GUILD_CREATE).
+        let present: HashSet<u64> = ready.guilds.iter().map(|guild| guild.id.get()).collect();
+        *self.bot_guilds.write().expect("bot guild lock poisoned") = present.clone();
+        // Removals while the bot was offline send no GUILD_DELETE.
+        let shard = ready
+            .shard
+            .map_or((0, 1), |shard| (shard.id.0, shard.total));
+        match self.db.reconcile_guilds(&present, shard).await {
+            Ok(left) => {
+                for guild_id in left {
+                    tracing::info!(guild_id, "guild_left_while_offline");
+                }
+            }
+            Err(_) => tracing::warn!("guild_reconcile_failed"),
+        }
         if self.registered.swap(true, Ordering::SeqCst) {
             return;
         }
         // Bulk-overwrite (rather than single create) so this call alone fully reflects the
         // current definition, even if a prior run registered /talk with different options.
-        let result =
-            Command::set_global_commands(&ctx.http, vec![talk_command(), config_command()]).await;
+        let result = Command::set_global_commands(
+            &ctx.http,
+            vec![talk_command(), config_command(), privacy_command()],
+        )
+        .await;
         if let Err(error) = result {
             self.registered.store(false, Ordering::SeqCst);
             match error {
@@ -212,12 +366,14 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        let Interaction::Command(command) = interaction else {
-            return;
-        };
-        match command.data.name.as_str() {
-            "talk" => self.handle(&ctx, &command).await,
-            "config" => self.config(&ctx, &command).await,
+        match interaction {
+            Interaction::Command(command) => match command.data.name.as_str() {
+                "talk" => self.handle(&ctx, &command).await,
+                "config" => self.config(&ctx, &command).await,
+                "privacy" => self.privacy(&ctx, &command).await,
+                _ => {}
+            },
+            Interaction::Component(component) => self.privacy_button(&ctx, &component).await,
             _ => {}
         }
     }
@@ -228,6 +384,12 @@ impl EventHandler for Handler {
             .expect("bot guild lock poisoned")
             .insert(guild.id.get());
         self.discord_cache.forget_guild(guild.id.get());
+        // Invited again within the grace period: the guild's data is kept.
+        match self.db.mark_guild_present(guild.id.get()).await {
+            Ok(true) => tracing::info!(guild_id = guild.id.get(), "guild_rejoined"),
+            Ok(false) => {}
+            Err(_) => tracing::warn!(guild_id = guild.id.get(), "guild_presence_save_failed"),
+        }
     }
 
     async fn guild_delete(
@@ -237,13 +399,19 @@ impl EventHandler for Handler {
         _full: Option<Guild>,
     ) {
         // `unavailable` means a Discord outage, not that the bot was removed.
+        let guild_id = incomplete.id.get();
         if !incomplete.unavailable {
             self.bot_guilds
                 .write()
                 .expect("bot guild lock poisoned")
-                .remove(&incomplete.id.get());
+                .remove(&guild_id);
+            // Starts the grace period before the guild's data is purged (GUILD_PURGE_GRACE_DAYS).
+            match self.db.mark_guild_left(guild_id).await {
+                Ok(()) => tracing::info!(guild_id, "guild_left"),
+                Err(_) => tracing::warn!(guild_id, "guild_presence_save_failed"),
+            }
         }
-        self.discord_cache.forget_guild(incomplete.id.get());
+        self.discord_cache.forget_guild(guild_id);
     }
 
     async fn guild_update(
@@ -712,6 +880,135 @@ impl Handler {
         reject(ctx, command, &message).await;
     }
 
+    /// /privacy show and delete. No allowlist or role check: everyone may see and erase their
+    /// own data.
+    async fn privacy(&self, ctx: &Context, command: &CommandInteraction) {
+        let Some(subcommand) = command.data.options.first() else {
+            return;
+        };
+        let user = command.user.id.get();
+        // Bounded to answer within Discord's 3-second window.
+        let holdings = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.db.privacy_holdings(user),
+        )
+        .await
+        {
+            Ok(Ok(holdings)) => holdings,
+            _ => {
+                tracing::warn!("privacy_lookup_failed");
+                reject(ctx, command, PRIVACY_LOOKUP_FAILED).await;
+                return;
+            }
+        };
+        match subcommand.name.as_str() {
+            "show" => {
+                let web = self
+                    .config
+                    .web
+                    .as_ref()
+                    .map(|web| web.public_origin.as_str());
+                reject(ctx, command, &describe_holdings(&holdings, web)).await;
+            }
+            "delete" => {
+                let now = Utc::now();
+                let buttons = CreateActionRow::Buttons(vec![
+                    CreateButton::new(privacy_button_id(true, user, now))
+                        .label("削除する")
+                        .style(ButtonStyle::Danger),
+                    CreateButton::new(privacy_button_id(false, user, now))
+                        .label("やめる")
+                        .style(ButtonStyle::Secondary),
+                ]);
+                let _ = command
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(describe_deletion(&holdings))
+                                .components(vec![buttons])
+                                .ephemeral(true)
+                                .allowed_mentions(no_mentions()),
+                        ),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    /// The buttons of /privacy delete. Only the user who ran the command may confirm.
+    async fn privacy_button(&self, ctx: &Context, component: &ComponentInteraction) {
+        let user = component.user.id.get();
+        let Some(button) = privacy_button(&component.data.custom_id, user, Utc::now()) else {
+            return;
+        };
+        let update = |content: &str| {
+            CreateInteractionResponse::UpdateMessage(
+                CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .components(Vec::new())
+                    .allowed_mentions(no_mentions()),
+            )
+        };
+        let response = match button {
+            PrivacyButton::NotYours => CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("この操作は、コマンドを実行した本人だけが行えます。")
+                    .ephemeral(true)
+                    .allowed_mentions(no_mentions()),
+            ),
+            PrivacyButton::Cancel => update("削除を取りやめました。"),
+            PrivacyButton::Expired => update(
+                "確認の有効期限が切れました。削除するには、もう一度 /privacy delete を実行してください。",
+            ),
+            PrivacyButton::Delete => CreateInteractionResponse::Acknowledge,
+        };
+        if component
+            .create_response(&ctx.http, response)
+            .await
+            .is_err()
+        {
+            tracing::warn!("interaction_response_failed");
+            return;
+        }
+        if button != PrivacyButton::Delete {
+            return;
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            privacy::erase_user(&self.db, Some(&self.chat), user),
+        )
+        .await;
+        let content = match result {
+            Ok(Ok(erasure)) => {
+                tracing::info!(
+                    talk_runs = erasure.talk_runs,
+                    talk_runs_in_progress = erasure.talk_runs_in_progress,
+                    web_conversations = erasure.web_conversations,
+                    web_sessions = erasure.web_sessions,
+                    source = "discord",
+                    "privacy_erased"
+                );
+                describe_erasure(&erasure)
+            }
+            _ => {
+                tracing::warn!("privacy_erase_failed");
+                "削除できませんでした。時間をおいて、もう一度 /privacy delete を実行してください。"
+                    .to_owned()
+            }
+        };
+        let _ = component
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new()
+                    .content(content)
+                    .components(Vec::new())
+                    .allowed_mentions(no_mentions()),
+            )
+            .await;
+    }
+
     async fn load_history(
         &self,
         ctx: &Context,
@@ -910,6 +1207,29 @@ mod tests {
             .map(|choice| choice["value"].as_str().unwrap())
             .collect();
         assert_eq!(choices, ["use", "manage"]);
+        let privacy = serde_json::to_value(privacy_command()).unwrap();
+        assert_eq!(privacy["name"], "privacy");
+        // Everyone may use it: no default permissions restrict the picker.
+        assert!(
+            privacy
+                .get("default_member_permissions")
+                .is_none_or(|p| p.is_null())
+        );
+        assert_eq!(privacy["contexts"], serde_json::json!([0]));
+        assert_eq!(privacy["integration_types"], serde_json::json!([0]));
+        let subcommands: Vec<_> = privacy["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| {
+                (
+                    option["name"].as_str().unwrap(),
+                    option["type"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        // SubCommand 1.
+        assert_eq!(subcommands, [("show", 1), ("delete", 1)]);
         let mentions = serde_json::to_value(no_mentions()).unwrap();
         assert_eq!(mentions["parse"], serde_json::json!([]));
         assert_eq!(mentions["replied_user"], false);
@@ -926,6 +1246,96 @@ mod tests {
         assert!(text.contains("<@&5>") && !text.contains("Web管理画面"));
         let text = describe_settings(7, &settings, Some("https://bot.example"));
         assert!(text.ends_with("<https://bot.example/#/guilds/7>"));
+    }
+
+    #[test]
+    fn privacy_buttons_work_only_for_their_user_and_in_time() {
+        let now = Utc::now();
+        let user = 123_456_789_012_345_678;
+        let delete = privacy_button_id(true, user, now);
+        let cancel = privacy_button_id(false, user, now);
+        assert!(delete.len() <= 100 && delete.starts_with("privacy:delete:"));
+        assert_eq!(
+            privacy_button(&delete, user, now),
+            Some(PrivacyButton::Delete)
+        );
+        assert_eq!(
+            privacy_button(&cancel, user, now),
+            Some(PrivacyButton::Cancel)
+        );
+        assert_eq!(
+            privacy_button(
+                &delete,
+                user,
+                now + Duration::seconds(PRIVACY_CONFIRM_SECONDS)
+            ),
+            Some(PrivacyButton::Delete)
+        );
+        assert_eq!(
+            privacy_button(
+                &delete,
+                user,
+                now + Duration::seconds(PRIVACY_CONFIRM_SECONDS + 1)
+            ),
+            Some(PrivacyButton::Expired)
+        );
+        assert_eq!(
+            privacy_button(&delete, user, now - Duration::minutes(5)),
+            Some(PrivacyButton::Expired)
+        );
+        // Cancelling never expires.
+        assert_eq!(
+            privacy_button(&cancel, user, now + Duration::days(1)),
+            Some(PrivacyButton::Cancel)
+        );
+        assert_eq!(
+            privacy_button(&delete, user + 1, now),
+            Some(PrivacyButton::NotYours)
+        );
+        for other in [
+            "",
+            "privacy",
+            "privacy:delete",
+            "privacy:delete:0:1",
+            "privacy:delete:x:1",
+            "privacy:delete:5:x",
+            "privacy:delete:5:1:extra",
+            "privacy:erase:5:1",
+            "talk:delete:5:1",
+        ] {
+            assert_eq!(privacy_button(other, 5, now), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn privacy_texts_report_counts_and_link_the_web_page() {
+        let holdings = Holdings {
+            talk_runs: 3,
+            web_conversations: 2,
+            web_sessions: 1,
+            kb_documents: 0,
+            guild_roles: 0,
+        };
+        let text = describe_holdings(&holdings, None);
+        assert!(text.contains("/talk の記録（質問と回答）: 3 件"));
+        assert!(!text.contains("ナレッジ資料") && !text.contains("Web 画面"));
+        let text = describe_holdings(
+            &Holdings {
+                kb_documents: 4,
+                ..holdings
+            },
+            Some("https://bot.example"),
+        );
+        assert!(text.contains("ナレッジ資料 4 件"));
+        assert!(text.ends_with("<https://bot.example/#/privacy>"));
+        assert!(describe_deletion(&holdings).contains("10 分以内"));
+        let erasure = Erasure {
+            talk_runs: 3,
+            talk_runs_in_progress: 1,
+            ..Erasure::default()
+        };
+        assert!(describe_erasure(&erasure).contains("回答を作成中の /talk の記録 1 件"));
+        assert!(!describe_erasure(&Erasure::default()).contains("作成中"));
     }
 
     #[test]

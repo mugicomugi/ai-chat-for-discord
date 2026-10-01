@@ -1,7 +1,7 @@
 //! Web UI tests. Without a database: security headers, the CSRF guard, the login redirect and
 //! state check, the login limits, the revocation of the user token when a login fails, the
-//! session requirement, the Discord OAuth2 client and the cached Discord REST lookups
-//! (wiremock). The `#[ignore]` tests need compose.test.yaml and TEST_DATABASE_URL.
+//! session requirement (the privacy API included), the Discord OAuth2 client and the cached
+//! Discord REST lookups (wiremock). The `#[ignore]` tests need compose.test.yaml and TEST_DATABASE_URL.
 
 use std::{
     io::{Read, Write},
@@ -22,12 +22,13 @@ use axum::{
 };
 use chrono::Utc;
 use discord_discussion_bot::{
-    access::{Access, GuildAccess},
+    access::{Access, GuildAccess, RoleKind},
     agent::Agent,
     config::{KbConfig, ProviderConfig, ProviderKind, WebConfig},
-    db::{Database, MAX_SESSIONS_PER_USER, SessionGuild},
+    db::{Database, MAX_SESSIONS_PER_USER, NewRun, SessionGuild},
     knowledge::{Knowledge, UPLOAD_SLOTS},
     limits::Limits,
+    privacy,
     web::{
         self, AppState, JsonBody, Shared, Web,
         auth::{OAuthClient, OAuthError},
@@ -100,6 +101,7 @@ fn state(db: Database, discord: &str) -> AppState {
             discord_ready: Arc::new(AtomicBool::new(true)),
             discord_cache: Default::default(),
             knowledge: None,
+            chat: Default::default(),
         },
     )
     .unwrap()
@@ -1572,6 +1574,7 @@ fn knowledge_state(db: Database, discord: &str, max_upload_bytes: usize) -> AppS
             discord_ready: Arc::new(AtomicBool::new(true)),
             discord_cache: Default::default(),
             knowledge: Some(Arc::new(knowledge)),
+            chat: Default::default(),
         },
     )
     .unwrap()
@@ -1937,4 +1940,526 @@ async fn knowledge_web_api() {
         clear_user(&db, user).await;
     }
     clear_guilds(&db, &[guild]).await;
+}
+
+#[tokio::test]
+async fn privacy_api_needs_a_session_and_same_origin() {
+    let state = state(offline_database(), "http://127.0.0.1:9");
+    let (status, _, body) = send(&state, get("/api/privacy")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(&body)["error"], "unauthenticated");
+    let delete = |origin: Option<&str>| {
+        let mut request =
+            Request::post("/api/privacy/delete").header(header::CONTENT_TYPE, "application/json");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        request.body(Body::from(r#"{"confirm":"DELETE"}"#)).unwrap()
+    };
+    for origin in [None, Some("https://evil.example")] {
+        let (status, _, body) = send(&state, delete(origin)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?}");
+        assert_eq!(json_body(&body)["error"], "cross_origin");
+    }
+    let (status, headers, body) = send(&state, delete(Some(ORIGIN))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(&body)["error"], "unauthenticated");
+    assert!(set_cookies(&headers).is_empty());
+}
+
+/// Rows of the privacy test, removed before and after it so that it can run again.
+async fn clear_privacy_test(db: &Database, users: &[u64], guilds: &[u64]) {
+    for user in users {
+        for statement in [
+            "DELETE FROM talk_runs WHERE user_id=?",
+            "DELETE FROM web_conversations WHERE user_id=?",
+            "DELETE FROM web_sessions WHERE user_id=?",
+            "DELETE FROM privacy_erasures WHERE user_id=?",
+        ] {
+            sqlx::query(statement)
+                .bind(user)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+    }
+    for guild in guilds {
+        for statement in [
+            "DELETE FROM talk_runs WHERE guild_id=?",
+            "DELETE FROM web_conversations WHERE guild_id=?",
+            "DELETE FROM kb_documents WHERE guild_id=?",
+        ] {
+            sqlx::query(statement)
+                .bind(guild)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+    }
+    clear_guilds(db, guilds).await;
+}
+
+async fn count(db: &Database, sql: &str, id: u64) -> i64 {
+    sqlx::query_scalar(sql)
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+async fn add_talk_run(db: &Database, id: u64, guild: u64, user: u64, finished: bool) {
+    add_talk_run_at(db, id, guild, user, finished, Utc::now()).await;
+}
+
+async fn add_talk_run_at(
+    db: &Database,
+    id: u64,
+    guild: u64,
+    user: u64,
+    finished: bool,
+    now: chrono::DateTime<Utc>,
+) {
+    assert!(
+        db.begin(&NewRun {
+            interaction_id: id,
+            guild_id: guild,
+            channel_id: guild + 1,
+            user_id: user,
+            user_name: "テスト",
+            question: "質問",
+            web_search: false,
+            history_seconds: 0,
+            invoked_at: now,
+        })
+        .await
+        .unwrap()
+    );
+    if finished {
+        db.reply(id, id + 50, 0, "回答", now).await.unwrap();
+        db.finish(id, None).await.unwrap();
+    }
+}
+
+async fn add_conversation(db: &Database, guild: u64, user: u64) -> u64 {
+    add_conversation_at(db, guild, user, Utc::now()).await
+}
+
+async fn add_conversation_at(
+    db: &Database,
+    guild: u64,
+    user: u64,
+    at: chrono::DateTime<Utc>,
+) -> u64 {
+    let id = sqlx::query("INSERT INTO web_conversations (user_id,guild_id,title,created_at,updated_at) VALUES (?,?,'会話',?,?)")
+        .bind(user).bind(guild).bind(at.naive_utc()).bind(at.naive_utc())
+        .execute(&db.pool).await.unwrap().last_insert_id();
+    sqlx::query("INSERT INTO web_messages (conversation_id,role,content,created_at) VALUES (?,'user','こんにちは',UTC_TIMESTAMP(3))")
+        .bind(id).execute(&db.pool).await.unwrap();
+    id
+}
+
+async fn add_document(db: &Database, guild: u64, user: u64, name: &str) -> u64 {
+    let id = sqlx::query("INSERT INTO kb_documents (guild_id,title,file_name,media_type,byte_size,sha256,content,char_count,chunk_count,status,uploaded_by,uploaded_by_name,created_at,updated_at) VALUES (?,?,'a.md','text/markdown',3,UNHEX(SHA2(?,256)),'本文',2,1,'ready',?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))")
+        .bind(guild).bind(name).bind(format!("{guild}-{name}")).bind(user).bind(name)
+        .execute(&db.pool).await.unwrap().last_insert_id();
+    sqlx::query("INSERT INTO kb_chunks (document_id,guild_id,seq,content) VALUES (?,?,0,'本文')")
+        .bind(id)
+        .bind(guild)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    id
+}
+
+async fn login(db: &Database, user: u64) -> String {
+    login_at(db, user, Utc::now()).await
+}
+
+async fn login_at(db: &Database, user: u64, at: chrono::DateTime<Utc>) -> String {
+    let token = security::new_token();
+    db.create_session(&security::hash(&token), user, "テスト", &[], at)
+        .await
+        .unwrap();
+    format!("__Host-session={}", security::encode(&token))
+}
+
+#[tokio::test]
+#[ignore = "requires compose.test.yaml and TEST_DATABASE_URL"]
+async fn privacy_and_guild_purge() {
+    let db = database().await;
+    let (user, other) = (975_001_u64, 975_002_u64);
+    // `kept` stays in use; `left` is purged after the grace period; `away` leaves and returns;
+    // `unknown` has no guilds row until the bot leaves it.
+    let (kept, left, away, unknown) = (975_100_u64, 975_200_u64, 975_300_u64, 975_400_u64);
+    let guilds = [kept, left, away, unknown];
+    clear_privacy_test(&db, &[user, other], &guilds).await;
+    for guild in [kept, left, away] {
+        db.allow_guild(guild, Some("テスト")).await.unwrap();
+    }
+
+    add_talk_run(&db, 975_011, kept, user, true).await;
+    // Still being answered: kept by the erasure.
+    add_talk_run(&db, 975_012, kept, user, false).await;
+    add_talk_run(&db, 975_013, kept, other, true).await;
+    add_talk_run(&db, 975_014, left, other, true).await;
+    let mine = add_conversation(&db, kept, user).await;
+    let theirs = add_conversation(&db, kept, other).await;
+    add_conversation(&db, left, other).await;
+    let cookie = login(&db, user).await;
+    login(&db, user).await;
+    login(&db, other).await;
+    let my_document = add_document(&db, kept, user, "mine").await;
+    let their_document = add_document(&db, kept, other, "theirs").await;
+    let left_document = add_document(&db, left, other, "left").await;
+    db.add_guild_role(kept, RoleKind::Use, 975_501, Some(user))
+        .await
+        .unwrap();
+    db.add_guild_role(kept, RoleKind::Manage, 975_502, Some(other))
+        .await
+        .unwrap();
+    db.add_guild_role(left, RoleKind::Use, 975_503, Some(other))
+        .await
+        .unwrap();
+
+    // The web page: counts, a confirmation, then erasure with the cookie cleared.
+    let state = state(db.clone(), "http://127.0.0.1:9");
+    let (status, _, body) = send(
+        &state,
+        Request::get("/api/privacy")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body),
+        json!({"talk_runs": 2, "web_conversations": 1, "web_sessions": 2, "kb_documents": 1, "guild_roles": 1})
+    );
+    let delete = |confirm: &str| {
+        Request::post("/api/privacy/delete")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, &cookie)
+            .body(Body::from(json!({ "confirm": confirm }).to_string()))
+            .unwrap()
+    };
+    let (status, _, body) = send(&state, delete("yes")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&body)["error"], "invalid_request");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM web_sessions WHERE user_id=?",
+            user
+        )
+        .await,
+        2
+    );
+    let (status, headers, body) = send(&state, delete("DELETE")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body),
+        json!({"talk_runs": 1, "talk_runs_in_progress": 1, "web_conversations": 1, "web_sessions": 2, "kb_documents": 1, "guild_roles": 1})
+    );
+    assert_eq!(
+        set_cookies(&headers),
+        ["__Host-session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure"]
+    );
+    let (status, _, _) = send(
+        &state,
+        Request::get("/api/privacy")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Deleted: the finished run with its reply, the conversation with its messages, sessions.
+    let rows = |sql: &'static str, id: u64| count(&db, sql, id);
+    assert_eq!(
+        rows(
+            "SELECT COUNT(*) FROM talk_runs WHERE interaction_id=?",
+            975_011
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        rows(
+            "SELECT COUNT(*) FROM talk_replies WHERE interaction_id=?",
+            975_011
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        rows(
+            "SELECT COUNT(*) FROM talk_runs WHERE interaction_id=?",
+            975_012
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        rows(
+            "SELECT COUNT(*) FROM web_messages WHERE conversation_id=?",
+            mine
+        )
+        .await,
+        0
+    );
+    // Anonymized, not deleted: the guild's document and role setting.
+    let row = sqlx::query("SELECT uploaded_by,uploaded_by_name FROM kb_documents WHERE id=?")
+        .bind(my_document)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<Option<u64>, _>("uploaded_by"), None);
+    assert_eq!(row.get::<Option<String>, _>("uploaded_by_name"), None);
+    let creator: Option<u64> =
+        sqlx::query_scalar("SELECT created_by FROM guild_roles WHERE guild_id=? AND role_id=?")
+            .bind(kept)
+            .bind(975_501_u64)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(creator, None);
+    // Other users' data is untouched.
+    assert_eq!(
+        db.privacy_holdings(other).await.unwrap(),
+        privacy::Holdings {
+            talk_runs: 2,
+            web_conversations: 2,
+            web_sessions: 1,
+            kb_documents: 2,
+            guild_roles: 2,
+        }
+    );
+    assert_eq!(
+        rows(
+            "SELECT COUNT(*) FROM web_messages WHERE conversation_id=?",
+            theirs
+        )
+        .await,
+        1
+    );
+    let uploader: Option<u64> =
+        sqlx::query_scalar("SELECT uploaded_by FROM kb_documents WHERE id=?")
+            .bind(their_document)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(uploader, Some(other));
+
+    // Erasing again is harmless; the run being answered is still reported as kept.
+    let again = privacy::erase_user(&db, None, user).await.unwrap();
+    assert_eq!(
+        again,
+        privacy::Erasure {
+            talk_runs_in_progress: 1,
+            ..Default::default()
+        }
+    );
+
+    // The ledger survives a restore: data from before the erasure that comes back is erased
+    // again, what the user created since stays, and the original erasure time is kept.
+    let erased_at = db
+        .erasure_ledger()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(id, _)| *id == user)
+        .expect("the erasure is in the ledger")
+        .1;
+    let text = privacy::format_ledger(&[(user, erased_at)]);
+    sqlx::query("DELETE FROM privacy_erasures WHERE user_id=?")
+        .bind(user)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let restored = erased_at - chrono::Duration::minutes(1);
+    add_talk_run_at(&db, 975_015, kept, user, true, restored).await;
+    add_conversation_at(&db, kept, user, restored).await;
+    login_at(&db, user, restored).await;
+    add_talk_run(&db, 975_016, kept, user, true).await;
+    let since = add_conversation(&db, kept, user).await;
+    let restored_document = add_document(&db, kept, other, "restored").await;
+    let mut entries = privacy::parse_ledger(&text).unwrap();
+    entries.extend(
+        privacy::parse_ledger(&format!("2026-09-01 kb_document={restored_document}")).unwrap(),
+    );
+    let applied = privacy::apply_ledger(&db, &entries).await.unwrap();
+    assert_eq!(
+        applied,
+        privacy::Applied {
+            users: 1,
+            rows: 3,
+            kb_documents: 1
+        }
+    );
+    let holdings = db.privacy_holdings(user).await.unwrap();
+    assert_eq!(
+        (
+            holdings.talk_runs,
+            holdings.web_conversations,
+            holdings.web_sessions
+        ),
+        (2, 1, 0)
+    );
+    assert_eq!(
+        rows(
+            "SELECT COUNT(*) FROM talk_runs WHERE interaction_id=?",
+            975_016
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        rows(
+            "SELECT COUNT(*) FROM web_messages WHERE conversation_id=?",
+            since
+        )
+        .await,
+        1
+    );
+    assert!(
+        db.erasure_ledger()
+            .await
+            .unwrap()
+            .contains(&(user, erased_at))
+    );
+    assert_eq!(
+        privacy::apply_ledger(&db, &entries).await.unwrap(),
+        privacy::Applied {
+            users: 1,
+            rows: 0,
+            kb_documents: 0
+        }
+    );
+    // Ledger entries go after 40 days.
+    sqlx::query("UPDATE privacy_erasures SET erased_at=? WHERE user_id=?")
+        .bind((Utc::now() - chrono::Duration::days(41)).naive_utc())
+        .bind(user)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        db.purge_erasures(Utc::now() - chrono::Duration::days(privacy::LEDGER_DAYS))
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        !db.erasure_ledger()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == user)
+    );
+
+    // Leaving and returning. The first departure time is kept.
+    let left_at = |guild: u64| {
+        let db = db.clone();
+        async move {
+            db.guilds()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.guild_id == guild)
+                .map(|row| row.left_at)
+        }
+    };
+    db.mark_guild_left(away).await.unwrap();
+    let first = left_at(away).await.unwrap().expect("left_at set");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    db.mark_guild_left(away).await.unwrap();
+    assert_eq!(left_at(away).await.unwrap(), Some(first));
+    assert!(db.mark_guild_present(away).await.unwrap());
+    assert!(!db.mark_guild_present(away).await.unwrap());
+    assert_eq!(left_at(away).await.unwrap(), None);
+    // A guild without a row gets one, not allowed.
+    db.mark_guild_left(unknown).await.unwrap();
+    let row = db
+        .guilds()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.guild_id == unknown)
+        .unwrap();
+    assert!(row.left_at.is_some() && !row.allowed());
+    // READY without `away`: recorded as left, but only by the shard that owns it. Every other
+    // guild of the test database counts as present, so other tests' rows stay untouched.
+    let mut present: std::collections::HashSet<u64> = db
+        .guilds()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.guild_id)
+        .collect();
+    present.remove(&away);
+    let other_shard = (privacy::shard_of(away, 2) + 1) % 2;
+    assert!(
+        db.reconcile_guilds(&present, (other_shard, 2))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(db.reconcile_guilds(&present, (0, 1)).await.unwrap(), [away]);
+    assert!(left_at(away).await.unwrap().is_some());
+    assert!(db.mark_guild_present(away).await.unwrap());
+
+    // The grace period: only guilds left before the cutoff with data are purged.
+    db.mark_guild_left(left).await.unwrap();
+    sqlx::query("UPDATE guilds SET left_at=? WHERE guild_id=?")
+        .bind((Utc::now() - chrono::Duration::days(15)).naive_utc())
+        .bind(left)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let cutoff = Utc::now() - chrono::Duration::days(14);
+    let due = db.guilds_to_purge(cutoff).await.unwrap();
+    assert!(due.contains(&left));
+    assert!(!due.contains(&kept) && !due.contains(&away) && !due.contains(&unknown));
+    assert_eq!(
+        db.purge_guild(left).await.unwrap(),
+        privacy::GuildPurge {
+            talk_runs: 1,
+            web_conversations: 1,
+            kb_documents: 1,
+            guild_roles: 1,
+        }
+    );
+    assert_eq!(
+        rows(
+            "SELECT COUNT(*) FROM kb_chunks WHERE document_id=?",
+            left_document
+        )
+        .await,
+        0
+    );
+    let row = db
+        .guilds()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.guild_id == left)
+        .unwrap();
+    assert!(!row.allowed() && row.left_at.is_some());
+    assert!(row.note.unwrap().starts_with("purged "));
+    assert!(!db.guild_access(left).await.unwrap().allowed);
+    assert!(!db.guilds_to_purge(cutoff).await.unwrap().contains(&left));
+    // The guild that stayed keeps everything.
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM talk_runs WHERE guild_id=?", kept).await,
+        3
+    );
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM kb_documents WHERE guild_id=?", kept).await,
+        2
+    );
+    assert!(db.guild_access(kept).await.unwrap().allowed);
+
+    clear_privacy_test(&db, &[user, other], &guilds).await;
 }

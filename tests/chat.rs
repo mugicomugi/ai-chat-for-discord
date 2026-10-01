@@ -108,6 +108,7 @@ fn state(
             discord_ready: Arc::new(AtomicBool::new(true)),
             discord_cache: Default::default(),
             knowledge,
+            chat: Default::default(),
         },
     )
     .unwrap()

@@ -44,6 +44,17 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 - Discordのサーバー設定の連携サービス（Integrations）でコマンド権限を設定すると、`/talk` を表示する相手をさらに絞れます。
 - サーバーの通常投稿は、発言者が利用ロールを持つかどうかに関わらず履歴の参照対象です。
 
+**自分のデータの確認と削除:** `/privacy` は、許可リストやロールに関係なく誰でも使えます（自分のデータだけが対象で、応答は本人にだけ表示されます）。
+
+```text
+/privacy show
+/privacy delete
+```
+
+- `show` は、このBotが保存している自分の `/talk` の記録・Webチャットの会話・Webのログインの件数（全サーバーの合計）を表示します。Web管理画面を有効にしている場合は、Web画面の「あなたのデータ」（`/#/privacy`）のURLも表示します。
+- `delete` は確認ボタン（10分間有効、押せるのは実行した本人だけ）を押すと、`/talk` の記録（返信の記録を含む）・Webチャットの会話（メッセージを含む）・Webのログイン（ログアウトされます）を削除し、ナレッジ資料とロール設定に記録された自分のIDと名前を消します（資料と設定はサーバーのものなので残ります）。回答を作成中の `/talk` の記録と、チャンネルに投稿された回答のメッセージは残ります。Web画面の「あなたのデータ」でも同じ削除ができます。
+- 削除したユーザーIDと日時は、バックアップから復元したときに削除し直すため40日間だけ記録します（[docs/privacy.md](docs/privacy.md)）。
+
 ## セットアップ
 
 ### 1. Discordアプリ
@@ -79,8 +90,9 @@ MARIADB_ROOT_PASSWORD=your_different_long_random_root_password
 
 - `BOT_IMAGE` は起動するイメージです。本番では `scripts/build-image.sh` が表示するタグ（`discord-discussion-bot:git-<コミット>`）を `scripts/deploy.sh` に渡すと書き換わります。手元でビルドする場合は `discord-discussion-bot:local` など任意の名前にします。
 - Ollamaキーは [Ollamaの設定](https://ollama.com/settings/keys) で発行します。推論と検索で同じキーを使用します。
-- `/talk` と `/config` はグローバルコマンドとして登録され、Botをインストールした全サーバーに表示されます（使えるのは許可リストに入ったサーバーだけです）。登録直後は反映まで最大1時間ほどかかる場合があります。会話履歴・DBの記録はサーバー（ギルド）ごとに分離されます。
+- `/talk`・`/config`・`/privacy` はグローバルコマンドとして登録され、Botをインストールした全サーバーに表示されます（`/talk` と `/config` を使えるのは許可リストに入ったサーバーだけです）。登録直後は反映まで最大1時間ほどかかる場合があります。会話履歴・DBの記録はサーバー（ギルド）ごとに分離されます。
 - `RETENTION_DAYS=30`：DBの保持期間（1〜3650日）。起動時と1時間ごとに期限切れを削除します。
+- `GUILD_PURGE_GRACE_DAYS=14`：Botがサーバーから外されてから、そのサーバーのデータ（`/talk` の記録・Webチャットの会話・ナレッジ資料・ロール設定）を削除するまでの猶予（1〜365日、空なら14日）。猶予中に再び招待されれば、そのまま使い続けられます。削除したサーバーは許可リストからも外れるので、再び使うには `ops guild allow` が必要です（[docs/runbook.md](docs/runbook.md)「Bot がサーバーから外されたとき」）。
 - `REQUEST_TIMEOUT_SECONDS=180`：履歴取得から回答投稿までのタイムアウト（10〜600秒）。個々のOllama HTTPリクエストは最大120秒です。
 - `RUST_LOG=discord_discussion_bot=info`：通常ログ。本文・キー・DBパスワード・内部推論は記録しません。依存ライブラリの詳細ログを有効にする場合は、そこに含まれるデータに注意してください。
 
@@ -148,6 +160,7 @@ Discordアカウントでログインして、Botを導入しているサーバ�
 - **権限**：`/talk` と同じ判定です。ロール設定を変更できるのはオーナーと「管理者」「サーバー管理」権限を持つ人だけで、Botの利用には利用ロールが必要です。メンバーのロールと権限はBotトークンでDiscordから取得し、60秒（サーバーのロールの定義とオーナーは5分。Discordでロールが作成・変更・削除されると即破棄）キャッシュします。ロールを外された人の画面上の権限は最大60秒残ります。ロールの設定自体はDBから毎回読むので、保存すると `/talk` にもすぐ反映されます。
 - **ロール設定の保存**：利用ロールとナレッジ管理ロールを1回の操作でまとめて置き換えます（各25個まで。サーバーに存在しないロールは保存できません）。Discordで削除済みのロールが設定に残っていた場合は、保存すると外れます。
 - **安全対策**：インラインスクリプトを使わず、外部のスクリプト・画像を読み込まない Content-Security-Policy、`X-Content-Type-Options: nosniff` などのヘッダーを付けます。GET以外のリクエストは `Origin` が `PUBLIC_BASE_URL` と一致しなければ拒否し、JSONの送信には `Content-Type: application/json` を必須にしています（CSRF対策）。HTTPS・HSTSはCaddyが担当します。
+- **あなたのデータ**：画面上部の「あなたのデータ」（`/#/privacy`）で、自分について保存されているデータの件数を確認し、確認の手順を経て削除できます（`/privacy delete` と同じ処理。サーバーの権限がなくてもログインしていれば使え、削除するとログアウトされます）。API は `GET /api/privacy` と `POST /api/privacy/delete`（本文 `{"confirm":"DELETE"}`）です。
 - **ページ**：`/privacy` と `/terms` で [docs/privacy.md](docs/privacy.md) と [docs/terms.md](docs/terms.md) を表示します（イメージに組み込むので、変更はイメージの再ビルドで反映されます）。`/healthz` は外部監視用です（DBとDiscordへの接続が正常なら200）。
 - 画面はビルド不要の素のHTML/JS/CSS（`static/`）で、バイナリに組み込まれます。Webチャットの回答の表示に [marked](https://github.com/markedjs/marked) と [DOMPurify](https://github.com/cure53/DOMPurify) を `static/vendor/` に同梱しています（ライセンスは `static/vendor/LICENSES.txt`）。
 
@@ -289,6 +302,7 @@ cargo test --locked --test chat web_chat_knowledge_notices -- --ignored --exact
 cargo test --locked --test chat web_chat_stops_with_partial_text -- --ignored --exact
 cargo test --locked --test chat web_chat_retention_and_recovery -- --ignored --exact
 bash scripts/check-vector-dump.sh
+cargo test --locked --test web privacy_and_guild_purge -- --ignored --exact
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
@@ -326,7 +340,8 @@ cargo test --locked --test live_embed -- --ignored --nocapture
 6. 同じチャンネルでの連続呼び出し、長文、権限不足、再起動後の会話継続を確認する。
 7. Web管理画面を有効にした場合：ログイン後のCookieが `__Host-session`（Secure・HttpOnly・SameSite=Lax）であること、ブラウザーの開発者ツールのコンソールにCSP違反が出ないこと、「サーバー管理」権限のないアカウントにはロール設定が表示されないこと、Web画面で保存したロールで `/talk` が使えること、Discordでロールを外すと60秒以内にWeb画面の権限からも外れること、ログアウト後に `/api/me` が401になること。
 8. Webチャット：回答が少しずつ表示されること、停止ボタンで途中までの回答が残ること、生成中にタブを閉じると生成も止まり（再度開くと「停止」で保存されている）、2つ目のタブからの送信は「作成中です」になること、`/talk` と合わせて4件を超えると「混み合っています」になること、XSS（`<img src=x onerror=alert(1)>` や `[x](javascript:alert(1))` を回答させても画像・スクリプトとして働かない）、開発者ツールのコンソールにCSP違反が出ないこと、利用ロールを外すと60秒以内に送信できなくなること。
-9. ナレッジベースを有効にした場合：日本語の PDF を登録してプレビューが文字化けしていないこと、上限を超えるファイル・同じファイルの再登録で理由が表示されること、利用ロールだけの人には「ナレッジ」タブが表示されないこと、`/talk` の回答末尾に「参照したナレッジ資料:」と資料名が表示されること、`knowledge:false` で参照しないこと、取り込み中に Bot を再起動しても続きから処理されること、Gemini のキーを無効にすると OpenAI に切り替わること、PDF の処理中のメモリ（`docker stats`）。
+9. `/privacy`：許可リストにないサーバーやロールのない人でも `show` が使えること、`delete` の確認ボタンで削除され、Web画面もログアウトされること（Web画面の「あなたのデータ」からの削除でも同様）、確認から10分を過ぎたボタンは期限切れになること。Botをサーバーから外すと `ops guild list` に `[bot left …]` と表示され、猶予内に招待し直すと元どおり使えること、猶予を過ぎるとそのサーバーのデータが削除され、許可リストから外れること。
+10. ナレッジベースを有効にした場合：日本語の PDF を登録してプレビューが文字化けしていないこと、上限を超えるファイル・同じファイルの再登録で理由が表示されること、利用ロールだけの人には「ナレッジ」タブが表示されないこと、`/talk` の回答末尾に「参照したナレッジ資料:」と資料名が表示されること、`knowledge:false` で参照しないこと、取り込み中に Bot を再起動しても続きから処理されること、Gemini のキーを無効にすると OpenAI に切り替わること、PDF の処理中のメモリ（`docker stats`）。
 
 ## 更新・バックアップ
 
@@ -352,7 +367,7 @@ docker compose exec db rm /tmp/discussion.sql
 docker compose up -d bot
 ```
 
-バックアップには会話が含まれるため、アクセスを制限して保管してください。本番の `docker compose down -v` はDBボリュームを削除するので、通常の停止では使いません。DBパスワードを `.env` だけで変更しても、既存ボリューム内のDBユーザーのパスワードは変更されません。
+本番で復元するときは、削除台帳（`ops privacy ledger export` / `apply`）でセルフ削除を適用し直します（[docs/runbook.md](docs/runbook.md)「バックアップと復元」）。バックアップには会話が含まれるため、アクセスを制限して保管してください。本番の `docker compose down -v` はDBボリュームを削除するので、通常の停止では使いません。DBパスワードを `.env` だけで変更しても、既存ボリューム内のDBユーザーのパスワードは変更されません。
 
 ## 参照仕様
 

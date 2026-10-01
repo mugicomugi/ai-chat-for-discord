@@ -24,6 +24,8 @@ services:
       MARIADB_PASSWORD: ${MARIADB_PASSWORD:?Set MARIADB_PASSWORD in .env}
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
       REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-180}
+      # Grace period before the data of a server the bot left is deleted (empty: 14 days).
+      GUILD_PURGE_GRACE_DAYS: ${GUILD_PURGE_GRACE_DAYS:-}
       RUST_LOG: ${RUST_LOG:-discord_discussion_bot=info}
       # Web UI: on only when all three are set (docs/runbook.md); empty values keep it off.
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}

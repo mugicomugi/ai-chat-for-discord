@@ -1,4 +1,5 @@
-//! The web UI: Discord login, the server list, role settings, the knowledge base and the chat.
+//! The web UI: Discord login, the server list, role settings, the knowledge base, the chat and
+//! the user's own data (privacy).
 //! It runs in the bot's process and shares its database pool, Discord REST client (and rate
 //! limits), generation limits and knowledge base.
 
@@ -9,6 +10,7 @@ pub mod authz;
 pub mod chat;
 pub mod chat_store;
 pub mod kb;
+pub mod privacy;
 pub mod security;
 
 use std::{
@@ -60,6 +62,8 @@ pub struct Shared {
     pub discord_cache: Arc<authz::DiscordCache>,
     /// `None` when the knowledge base is disabled.
     pub knowledge: Option<Arc<Knowledge>>,
+    /// The web chat's answers being generated; /privacy delete stops the user's.
+    pub chat: Arc<chat::Chat>,
 }
 
 pub struct Web {
@@ -78,7 +82,7 @@ pub struct Web {
     /// `None` when the knowledge base is disabled; its pages then answer 404.
     pub knowledge: Option<Arc<Knowledge>>,
     /// Answers being generated and recent questions (in memory).
-    pub chat: chat::Chat,
+    pub chat: Arc<chat::Chat>,
 }
 
 pub type AppState = Arc<Web>;
@@ -97,7 +101,7 @@ impl Web {
             limits: shared.limits,
             bot_guilds: shared.bot_guilds,
             discord_ready: shared.discord_ready,
-            chat: chat::Chat::default(),
+            chat: shared.chat,
         }))
     }
 
@@ -156,6 +160,8 @@ pub fn router(state: AppState) -> Router {
             post(chat::send).layer(DefaultBodyLimit::max(chat::MAX_MESSAGE_BODY_BYTES)),
         )
         .route("/api/chat/stop", post(chat::stop))
+        .route("/api/privacy", get(privacy::show))
+        .route("/api/privacy/delete", post(privacy::delete))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
