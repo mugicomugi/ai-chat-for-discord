@@ -5,9 +5,14 @@
 use std::{
     collections::HashMap,
     hash::Hash,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
+
+use chrono::Utc;
 
 use serenity::{
     all::{GuildId, Member, PartialGuild, UserId},
@@ -41,23 +46,16 @@ pub struct DiscordCache {
     /// `None` records "not a member", so repeated requests do not hit REST.
     members: Cache<(u64, u64), Option<Arc<Member>>>,
     guilds: Cache<u64, Arc<PartialGuild>>,
+    /// Bumped (under the `guilds` lock) by every guild event, so a REST answer that was on its
+    /// way while the event arrived is not cached as if it were newer.
+    guild_events: AtomicU64,
 }
 
 impl DiscordCache {
     pub fn forget_guild(&self, guild: u64) {
-        self.guilds
-            .lock()
-            .expect("guild cache poisoned")
-            .remove(&guild);
-    }
-
-    pub fn len(&self) -> usize {
-        self.members.lock().expect("member cache poisoned").len()
-            + self.guilds.lock().expect("guild cache poisoned").len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        let mut guilds = self.guilds.lock().expect("discord cache poisoned");
+        self.guild_events.fetch_add(1, Ordering::Relaxed);
+        guilds.remove(&guild);
     }
 }
 
@@ -68,9 +66,8 @@ fn cached<K: Eq + Hash, T: Clone>(map: &Cache<K, T>, key: &K, ttl: Duration) -> 
         .map(|entry| entry.value.clone())
 }
 
-/// Bounded: expired entries go first, then the oldest one.
-fn store<K: Eq + Hash + Copy, T>(map: &Cache<K, T>, key: K, value: T, ttl: Duration) {
-    let mut map = map.lock().expect("discord cache poisoned");
+/// Bounded: expired entries go first, then the oldest one. Takes the locked map.
+fn store<K: Eq + Hash + Copy, T>(map: &mut HashMap<K, Entry<T>>, key: K, value: T, ttl: Duration) {
     if map.len() >= MAX_ENTRIES && !map.contains_key(&key) {
         map.retain(|_, entry| entry.at.elapsed() < ttl);
         if map.len() >= MAX_ENTRIES
@@ -142,7 +139,7 @@ impl Authz {
             Err(error) => return Err(rest_failed(guild, &error)),
         };
         store(
-            &self.cache.members,
+            &mut self.cache.members.lock().expect("discord cache poisoned"),
             (guild, user),
             member.clone(),
             MEMBER_TTL,
@@ -154,6 +151,7 @@ impl Authz {
         if let Some(cached) = cached(&self.cache.guilds, &guild, GUILD_TTL) {
             return Ok(cached);
         }
+        let events = self.cache.guild_events.load(Ordering::Relaxed);
         let mut partial = self
             .rest(self.http.get_guild(GuildId::new(guild)))
             .await?
@@ -162,7 +160,10 @@ impl Authz {
         partial.emojis = HashMap::new();
         partial.stickers = HashMap::new();
         let partial = Arc::new(partial);
-        store(&self.cache.guilds, guild, partial.clone(), GUILD_TTL);
+        let mut guilds = self.cache.guilds.lock().expect("discord cache poisoned");
+        if self.cache.guild_events.load(Ordering::Relaxed) == events {
+            store(&mut guilds, guild, partial.clone(), GUILD_TTL);
+        }
         Ok(partial)
     }
 
@@ -231,15 +232,26 @@ pub async fn resolve(state: &Web, session: &Session, guild: u64) -> Result<Resol
 }
 
 /// Guild-level permissions as Discord computes them (owner and ADMINISTRATOR get everything).
+/// serenity ignores the restrictions Discord applies on top, so they are applied here: a member
+/// in a timeout (which owners and administrators cannot be put in) or one who has not passed
+/// membership screening gets nothing, as they could not use the commands in Discord either.
 pub fn decide(settings: &GuildAccess, guild: &PartialGuild, member: &Member) -> Access {
+    let is_owner = guild.owner_id == member.user.id;
+    let permissions = guild.member_permissions(member);
+    let timed_out = member
+        .communication_disabled_until
+        .is_some_and(|until| until.unix_timestamp() > Utc::now().timestamp());
+    if !is_owner && (member.pending || (timed_out && !permissions.administrator())) {
+        return Access::default();
+    }
     let roles: Vec<u64> = member.roles.iter().map(|role| role.get()).collect();
     access::decide(
         settings,
         &access::Member {
             guild_id: guild.id.get(),
             roles: &roles,
-            permissions: guild.member_permissions(member),
-            is_owner: guild.owner_id == member.user.id,
+            permissions,
+            is_owner,
         },
     )
 }

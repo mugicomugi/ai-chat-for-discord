@@ -4,7 +4,10 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::history::Entry;
+use crate::{
+    bounded::{self, BodyError},
+    history::Entry,
+};
 
 const MAX_TOOLS: usize = 5;
 const MAX_RESPONSE_BYTES: usize = 2_000_000;
@@ -101,7 +104,7 @@ impl Agent {
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value, AgentError> {
-        let mut response = self
+        let response = self
             .client
             .post(format!("{}{path}", self.base_url))
             .bearer_auth(&self.key)
@@ -119,14 +122,12 @@ impl Agent {
             status if !status.is_success() => return Err(AgentError::Upstream),
             _ => {}
         }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(network_error)? {
-            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                return Err(AgentError::InvalidResponse);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&bytes).map_err(|_| AgentError::InvalidResponse)
+        bounded::json(response, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                BodyError::Transport(error) => network_error(error),
+                BodyError::Invalid => AgentError::InvalidResponse,
+            })
     }
 
     pub async fn answer(

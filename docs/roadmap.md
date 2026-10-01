@@ -58,7 +58,7 @@ M1 履歴拡張＋ギルド許可リスト＋ロール制限（Discordだけで�
 |---|---|---|
 | `axum 0.8`（`default-features=false`, `http1,tokio,json,query`） | Webサーバー・SSE | hyper 1 / http 1 / tower 0.5 はロック済みのものを共有。ws は使わない（tungstenite 重複を避ける） |
 | `ring 0.17` | 乱数・SHA-256・定数時間比較 | rustls 経由で既にビルド済み |
-| `base64 0.22`, `url 2`, `tokio-stream 0.1` | トークン符号化・URL検証・SSE | ロック済み |
+| `base64 0.22`, `url 2`, `tokio-stream 0.1` | トークン符号化・URL検証・SSE | ロック済み（`tokio-stream` は SSE を作る M4 で追加） |
 | `pulldown-cmark 0.13`（`html` のみ） | `/privacy` `/terms` を起動時にHTML化 | 小 |
 | `pdf-extract 0.12`（cargo feature `pdf`、既定ON） | PDFテキスト抽出 | lopdf ≥0.42 必須（RUSTSEC-2026-0187）。ビルドメモリを CI で計測 |
 | dev: `tower`（`util`）, `http-body-util 0.1` | axum ハンドラーの `oneshot` テスト | |
@@ -141,7 +141,7 @@ tokio に `process`, `io-util` を追加。tower-sessions・axum-extra・multer�
   - シャットダウンは `watch` チャネルで Web（`with_graceful_shutdown`）・ワーカー・Discord を揃えて止める（最大10秒待ち）。
   - `bot_guilds: Arc<RwLock<HashSet<u64>>>` を `guild_create` / `guild_delete` で維持（serenity cache は無効のため）。
 - `src/limits.rs`：キーを `enum Key { Channel(u64), User(u64) }` にし、全体の同時実行4枠を Discord と Web で共有。
-- `Dockerfile` の source ステージに `COPY static ./static` と `COPY docs ./docs`。`scripts/build-image.sh` のクリーンツリー確認にも `static docs` を追加。
+- `Dockerfile` の source ステージに `COPY static ./static` と `docs/privacy.md`・`docs/terms.md` の COPY（docs/ 全体はコピーしない。runbook の編集でビルドキャッシュが無効にならないように）。`scripts/build-image.sh` のクリーンツリー確認にも同じものを追加。
 
 ### ルート
 
@@ -149,7 +149,7 @@ tokio に `process`, `io-util` を追加。tower-sessions・axum-extra・multer�
 |---|---|---|
 | `GET /`, `/static/*` | なし | アプリ本体 |
 | `GET /privacy`, `/terms` | なし | `docs/*.md` を起動時に HTML 化 |
-| `GET /healthz` | なし | DB `SELECT 1`（2秒）かつ Discord 接続済みなら200、それ以外は503。本文に詳細は出さない |
+| `GET /healthz` | なし | DB `SELECT 1`（2秒）かつ Discord 接続済みなら200、それ以外は503。本文に詳細は出さない。接続状態は serenity の `ShardManager` の runner 一覧から5秒ごとに取る（再接続の多くはイベントが出ないため） |
 | `GET /auth/login`, `/auth/callback` | なし | Discord OAuth2 |
 | `POST /auth/logout` | セッション | |
 | `GET /api/me` | セッション | ユーザー、サーバー一覧、サーバーごとの `{use, manage_kb, configure}` |
@@ -166,6 +166,8 @@ Snowflake ID は JSON では**文字列**で返す（JS の 2^53 超え対策）
   3. `/users/@me` と `/users/@me/guilds` を取得。
   4. **ユーザートークンは即 revoke して保存しない**。
   5. 許可リストに入っているサーバーだけをセッションに保存。
+  - 2〜4 はリクエストから切り離したタスクで実行する（ブラウザが途中で切断しても revoke まで進む）。
+  - Discord を呼ぶログインは**同時2件・毎分20件まで**。超えたら Discord を呼ばずに503（`Retry-After` 付き）。state の二重送信はスクリプトでも満たせるため、Bot と共有する IP の無効リクエスト上限（429 が10分で1万件を超えると API 全体が止まる）をここで守る。429 を受けたら `Retry-After`（なければ60秒、最大600秒）まで新しいログインを止める。
 - `0004_web_sessions`：`token_hash BINARY(32)` PK, `user_id`, `user_name`, `guilds JSON`, `created_at`, `expires_at`（7日、延長なし、1人10件まで）。
 - Cookie：`__Host-session`（Secure, HttpOnly, SameSite=Lax, Path=/）。ログインのたびに新しいトークンを発行（セッション固定対策）。
 - **CSRF**：GET 以外は `Origin` が `PUBLIC_BASE_URL` と一致しなければ403。JSON 系は `Content-Type: application/json` 必須、アップロードは独自ヘッダー `X-File-Name` 必須（プリフライトを強制）。
@@ -178,9 +180,9 @@ Snowflake ID は JSON では**文字列**で返す（JS の 2^53 超え対策）
 1. パスのサーバーが「セッションのサーバー ∩ 許可リスト ∩ `bot_guilds`」に無ければ404（REST を呼ばない）。
 2. メンバー情報を `http.get_member`（60秒キャッシュ、404も保存）で取得。
 3. サーバー情報を `http.get_guild`（オーナー・ロール・権限、300秒キャッシュ。`guild_role_update/delete` で破棄）で取得。
-4. `PartialGuild::member_permissions` で権限を計算し、`access::decide` で判定。
+4. `PartialGuild::member_permissions` で権限を計算し、`access::decide` で判定。serenity が考慮しないタイムアウト中（管理者・オーナーを除く）とメンバー審査待ち（`pending`）のメンバーは、権限なしとする。
 
-- ロール設定は DB から毎回読む（変更は即時反映）。メンバーのロール剥奪の反映は最大60秒。
+- ロール設定は DB から毎回読む（変更は即時反映）。メンバーのロール剥奪の反映は最大60秒。サーバー情報の取得中にギルドのイベントが届いたら、その応答はキャッシュしない（古い情報が300秒残らないように）。
 - REST は `Semaphore(2)`＋5秒タイムアウト。超えたら503。キャッシュは最大2,000件の `Mutex<HashMap>`。
 
 ### Caddy（HTTPS）
@@ -189,7 +191,7 @@ Snowflake ID は JSON では**文字列**で返す（JS の 2^53 超え対策）
   - ポート 80/443、ネットワーク `edge`、`mem_limit: 96m`、`read_only`、`cap_drop: [ALL]`、`cap_add: [NET_BIND_SERVICE]`。
   - ボリュームは `caddy_data` / `caddy_config`。
 - `deploy/caddy/Caddyfile`：`{$DOMAIN}` → `reverse_proxy bot:8080 { flush_interval -1 }`（SSE をバッファしない）、`request_body max_size 6MB`、h1/h2 のみ、`encode` は使わない。
-- Bot サービスに `healthcheck: ["CMD","/app/bot","healthcheck"]` を追加（`scripts/healthwatch.sh` は caddy を既に監視対象にしている）。
+- Bot のヘルスチェックは `Dockerfile` の `runtime-base` に `HEALTHCHECK CMD ["/app/bot","healthcheck"]` として入れる（`compose.yaml` には書かない。M2 より前のバイナリは `healthcheck` 引数を通常起動として扱うため、切り戻した古いイメージで2つ目の Bot が起動してしまう）。`scripts/healthwatch.sh` は caddy を既に監視対象にしている。
 
 ### 画面（M2時点）
 ログイン → サーバー選択 → サーバー設定（利用ロール・ナレッジ管理ロールの複数選択。`configure` 権限者のみ表示）。
@@ -320,7 +322,7 @@ Snowflake ID は JSON では**文字列**で返す（JS の 2^53 超え対策）
 - **Bot がサーバーから外されたとき**
   - `guild_delete`（unavailable=false）で `left_at` を記録する。`guild_create` で解除する。
   - `ready` 時に、参加中サーバーと DB を突き合わせて取りこぼしを補う。
-  - 猶予（`GUILD_PURGE_GRACE_DAYS`）を過ぎたら、そのサーバーの `talk_runs`・Web会話・ナレッジ・ロール設定を削除する。`ops guild purge <id>` も用意。
+  - 猶予（`GUILD_PURGE_GRACE_DAYS`）を過ぎたら、そのサーバーの `talk_runs`・Web会話・ナレッジ・ロール設定を削除する。`ops guild purge <id>` も用意。ロール設定を消すトランザクションは、M2 のロール保存と同じく先に `guilds` 行を `FOR UPDATE` でロックする（READ COMMITTED ではギャップロックがないため。ロック順は `guilds` → `guild_roles`）。
 - **文書**
   - `docs/privacy.md`：Web セッション・Cookie、Web 会話の保持、ナレッジ資料、Gemini/OpenAI への送信（Gemini は有料枠）、セルフ削除、削除猶予、履歴7日・100件。
   - `docs/terms.md`：アップロードする資料の権利、個人情報を入れないこと、資料が公開回答に現れ得ること。
@@ -354,6 +356,7 @@ Snowflake ID は JSON では**文字列**で返す（JS の 2^53 超え対策）
 - **ビルドメモリ**：pdf-extract と axum。超える場合は `pdf` feature を外すか、`[profile.release.package.lopdf] opt-level = 0`。
 - **レート制限**
   - Bot トークンでの REST：キャッシュ・サーバー一覧での事前絞り込み・同時2件で抑える。
+  - OAuth（ログイン）：同時2件・毎分20件と、429 後の停止で抑える（同じ IP を使う）。
   - Ollama：1日の上限で抑える。
   - Gemini/OpenAI の429：バックオフする。
 - **プロンプトインジェクション**：資料は信頼できない JSON として渡し、`web_fetch` の取得先を制限し、リンクプレビューを抑止。Web は CSP の `img-src 'self'` と DOMPurify で画像経由の送信を防ぐ。

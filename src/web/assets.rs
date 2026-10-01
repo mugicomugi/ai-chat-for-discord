@@ -241,6 +241,27 @@ mod tests {
     }
 
     #[test]
+    fn vendored_files_match_the_pinned_versions() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../static/vendor/package.json")).unwrap();
+        let version = |name: &str| manifest["dependencies"][name].as_str().unwrap().to_owned();
+        let file = |path: &str| {
+            let asset = ASSETS.iter().find(|asset| asset.path == path).unwrap();
+            std::str::from_utf8(asset.body).unwrap()
+        };
+        let licenses = file("vendor/LICENSES.txt");
+        let dompurify = version("dompurify");
+        assert!(
+            file("vendor/purify.min.js")
+                .starts_with(&format!("/*! @license DOMPurify {dompurify} "))
+        );
+        assert!(licenses.contains(&format!("dompurify@{dompurify} ")));
+        let marked = version("marked");
+        assert!(file("vendor/marked.min.js").contains(&format!(" * marked v{marked} - ")));
+        assert!(licenses.contains(&format!("marked@{marked} ")));
+    }
+
+    #[test]
     fn every_asset_has_an_etag() {
         assert_eq!(ETAGS.len(), ASSETS.len());
         assert!(ETAGS.iter().all(|tag| tag.len() == 34));

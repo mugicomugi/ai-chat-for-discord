@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     access::{Access, GuildAccess, MAX_ROLES_PER_KIND, RoleKind},
-    db::{id_string, parse_snowflake},
+    ids::{id_string, parse_snowflake},
 };
 
 #[derive(Serialize)]

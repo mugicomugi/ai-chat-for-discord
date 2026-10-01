@@ -16,7 +16,8 @@ use serenity::{
 use crate::{
     access::{MAX_ROLES_PER_KIND, RoleKind},
     config::Config,
-    db::{Database, RoleChange, parse_snowflake},
+    db::{Database, RoleChange},
+    ids::parse_snowflake,
 };
 
 pub const USAGE: &str = "usage:

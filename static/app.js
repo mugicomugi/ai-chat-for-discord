@@ -92,10 +92,40 @@ export const guildTabs = [
   { id: "roles", label: "ロール設定", visible: (rights) => rights.configure, render: rolesTab },
 ];
 
+const GUILD_PATH = /^\/guilds\/(\d{1,20})(?:\/([a-z-]+))?$/;
+
 export const routes = [
   { path: /^\/$/, refresh: true, view: homeView },
-  { path: /^\/guilds\/(\d{1,20})(?:\/([a-z-]+))?$/, view: guildView },
+  { path: GUILD_PATH, view: guildView },
 ];
+
+// A server page opened while logged out (for example the link of /config show) is reopened
+// after the login, which always returns to "/". sessionStorage survives the trip to Discord
+// within the tab; without it the user simply lands on the server list.
+const RETURN_KEY = "return-to";
+
+function rememberReturn() {
+  const path = location.hash.replace(/^#/, "");
+  try {
+    if (GUILD_PATH.test(path)) {
+      sessionStorage.setItem(RETURN_KEY, path);
+    } else {
+      sessionStorage.removeItem(RETURN_KEY);
+    }
+  } catch {
+    // Storage disabled.
+  }
+}
+
+function takeReturn() {
+  try {
+    const path = sessionStorage.getItem(RETURN_KEY);
+    sessionStorage.removeItem(RETURN_KEY);
+    return path !== null && GUILD_PATH.test(path) ? path : null;
+  } catch {
+    return null;
+  }
+}
 
 let rendering = 0;
 
@@ -106,6 +136,12 @@ async function render() {
   let content;
   try {
     const me = await loadMe(route?.refresh);
+    const back = me && path === "/" ? takeReturn() : null;
+    if (back) {
+      // The hashchange renders it.
+      location.replace(`#${back}`);
+      return;
+    }
     if (!me) {
       content = loginView();
     } else if (!route) {
@@ -161,7 +197,7 @@ function loginView() {
       {},
       "Discord アカウントでログインすると、Bot を導入しているサーバーでのあなたの権限を確認でき、サーバー管理者は Bot を使えるロールを設定できます。",
     ),
-    h("p", {}, h("a", { class: "button primary", href: "/auth/login" }, "Discord でログイン")),
+    h("p", {}, h("a", { class: "button primary", href: "/auth/login", onclick: rememberReturn }, "Discord でログイン")),
     h(
       "p",
       { class: "muted" },

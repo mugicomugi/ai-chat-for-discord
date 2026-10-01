@@ -1,11 +1,15 @@
 //! Web UI tests. Without a database: security headers, the CSRF guard, the login redirect and
-//! state check, the session requirement, the Discord OAuth2 client and the cached Discord REST
-//! lookups (wiremock). The `#[ignore]` tests need compose.test.yaml and TEST_DATABASE_URL.
+//! state check, the login limits, the revocation of the user token when a login fails, the
+//! session requirement, the Discord OAuth2 client and the cached Discord REST lookups
+//! (wiremock). The `#[ignore]` tests need compose.test.yaml and TEST_DATABASE_URL.
 
 use std::{
     io::{Read, Write},
     net::TcpListener,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -18,7 +22,7 @@ use axum::{
 };
 use chrono::Utc;
 use discord_discussion_bot::{
-    access::GuildAccess,
+    access::{Access, GuildAccess},
     agent::Agent,
     config::WebConfig,
     db::{Database, MAX_SESSIONS_PER_USER, SessionGuild},
@@ -27,21 +31,32 @@ use discord_discussion_bot::{
         self, AppState, JsonBody, Shared, Web,
         auth::{OAuthClient, OAuthError},
         authz::{self, Authz, DiscordCache, Unavailable},
-        security::{self, CSP},
+        security,
     },
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use serenity::http::HttpBuilder;
-use sqlx::{ConnectOptions, Row, mysql::MySqlConnectOptions, mysql::MySqlPoolOptions};
+use serenity::{
+    all::{Member, PartialGuild},
+    http::HttpBuilder,
+};
+use sqlx::{Row, mysql::MySqlPoolOptions};
 use tower::ServiceExt;
 use url::Url;
 use wiremock::{
     Mock, MockServer, Request as MockRequest, ResponseTemplate,
-    matchers::{body_string_contains, header as mock_header, method, path, query_param},
+    matchers::{
+        body_string_contains, header as mock_header, method, path, path_regex, query_param,
+    },
 };
 
+mod common;
+use common::database;
+
 const ORIGIN: &str = "https://bot.example";
+/// The Content-Security-Policy of docs/roadmap.md, written out rather than taken from the crate,
+/// so that a loosened policy fails here.
+const POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 const ADMINISTRATOR: u64 = 1 << 3;
 const MANAGE_GUILD: u64 = 1 << 5;
 
@@ -122,8 +137,7 @@ async fn pages_have_security_headers_and_cacheable_assets() {
         "/api/nowhere",
     ] {
         let (_, headers, _) = send(&state, get(uri)).await;
-        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], CSP, "{uri}");
-        assert!(CSP.contains("frame-ancestors 'none'") && !CSP.contains("unsafe"));
+        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], POLICY, "{uri}");
         assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{uri}");
         assert_eq!(
             headers["cross-origin-opener-policy"], "same-origin",
@@ -210,7 +224,7 @@ async fn writes_from_other_origins_are_rejected() {
         let (status, headers, body) = send(&state, post(origin)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?}");
         assert_eq!(json_body(&body)["error"], "cross_origin");
-        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], CSP);
+        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], POLICY);
         assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     }
     let (status, _, body) = send(
@@ -317,7 +331,169 @@ async fn callback_rejects_missing_or_wrong_state_without_calling_discord() {
             set_cookies(&headers),
             ["__Host-oauth=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure"]
         );
-        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], CSP);
+        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], POLICY);
+    }
+}
+
+/// A callback whose state cookie and parameter match, as any script can send.
+fn forged_callback() -> Request<Body> {
+    let value = security::encode(&security::new_token());
+    Request::get(format!("/auth/callback?code=c&state={value}"))
+        .header(header::COOKIE, format!("__Host-oauth={value}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn retry_after(headers: &HeaderMap) -> u64 {
+    headers[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Token exchanges that Discord refuses (a wrong code), counted by wiremock.
+async fn mock_rejected_exchange(discord: &MockServer, delay: Duration, expect: u64) {
+    Mock::given(method("POST"))
+        .and(path("/api/v10/oauth2/token"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"error": "invalid_grant"}))
+                .set_delay(delay),
+        )
+        .expect(expect)
+        .mount(discord)
+        .await;
+}
+
+#[tokio::test]
+async fn login_floods_are_refused_before_reaching_discord() {
+    // At most 20 logins a minute reach Discord, however fast they arrive.
+    let discord = MockServer::start().await;
+    mock_rejected_exchange(&discord, Duration::ZERO, 20).await;
+    let state = state(offline_database(), &discord.uri());
+    for attempt in 0..30 {
+        let (status, headers, body) = send(&state, forged_callback()).await;
+        if attempt < 20 {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{attempt}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{attempt}");
+        assert!((1..=60).contains(&retry_after(&headers)));
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("混み合っています")
+        );
+        assert_eq!(
+            set_cookies(&headers),
+            ["__Host-oauth=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure"]
+        );
+    }
+    discord.verify().await;
+
+    // And at most two at a time; the others are refused at once instead of queueing.
+    let discord = MockServer::start().await;
+    mock_rejected_exchange(&discord, Duration::from_millis(500), 2).await;
+    let state = self::state(offline_database(), &discord.uri());
+    let mut logins = tokio::task::JoinSet::new();
+    for _ in 0..6 {
+        let state = state.clone();
+        logins.spawn(async move { send(&state, forged_callback()).await.0 });
+    }
+    let mut statuses = logins.join_all().await;
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ]
+    );
+    discord.verify().await;
+}
+
+#[tokio::test]
+async fn a_discord_rate_limit_pauses_logins() {
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v10/oauth2/token"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "30")
+                .set_body_json(json!({"retry_after": 29.5, "global": false})),
+        )
+        .expect(1)
+        .mount(&discord)
+        .await;
+    let state = state(offline_database(), &discord.uri());
+    let (status, headers, _) = send(&state, forged_callback()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_after(&headers), 30);
+    for _ in 0..3 {
+        let (status, headers, _) = send(&state, forged_callback()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!((29..=30).contains(&retry_after(&headers)));
+    }
+    discord.verify().await;
+}
+
+/// A code exchange and user lookup that succeed; the guild list answers `guilds_status`.
+async fn mock_login(discord: &MockServer, guilds_status: u16) {
+    Mock::given(method("POST"))
+        .and(path("/api/v10/oauth2/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"access_token": "user-token"})),
+        )
+        .expect(1)
+        .mount(discord)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v10/users/@me"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": "940001", "username": "u", "global_name": null})),
+        )
+        .expect(1)
+        .mount(discord)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v10/users/@me/guilds"))
+        .respond_with(ResponseTemplate::new(guilds_status).set_body_json(json!([])))
+        .expect(1)
+        .mount(discord)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v10/oauth2/token/revoke"))
+        .and(body_string_contains("token=user-token"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(discord)
+        .await;
+}
+
+#[tokio::test]
+async fn failed_logins_still_revoke_the_user_token() {
+    // Discord fails after the exchange; then the database fails after Discord answered.
+    for (guilds_status, expected) in [
+        (500, StatusCode::BAD_GATEWAY),
+        (200, StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let discord = MockServer::start().await;
+        mock_login(&discord, guilds_status).await;
+        let state = state(offline_database(), &discord.uri());
+        let (status, headers, _) = send(&state, forged_callback()).await;
+        assert_eq!(status, expected, "{guilds_status}");
+        // No session cookie.
+        assert_eq!(
+            set_cookies(&headers),
+            ["__Host-oauth=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure"]
+        );
+        discord.verify().await;
     }
 }
 
@@ -649,7 +825,7 @@ async fn discord_lookups_are_cached_and_decided_by_access_rules() {
         assert!(access.use_bot && !access.manage_knowledge && !access.configure);
         assert!(authz.member(guild, outsider).await.unwrap().is_none());
     }
-    assert_eq!(cache.len(), 3);
+    // The mocks' call counts show the second round came from the cache.
     cache.forget_guild(guild);
     let partial = authz.guild(guild).await.unwrap();
     assert!(partial.emojis.is_empty());
@@ -687,6 +863,87 @@ async fn owners_and_administrators_are_recognized() {
 }
 
 #[tokio::test]
+async fn a_guild_event_during_a_lookup_keeps_its_answer_out_of_the_cache() {
+    let discord = MockServer::start().await;
+    let guild = 650_u64;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v10/guilds/{guild}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(guild_json(guild, 651, &[]))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .expect(2)
+        .mount(&discord)
+        .await;
+    let cache = Arc::new(DiscordCache::default());
+    let authz = Arc::new(Authz::new(bot_http(&discord), cache.clone()));
+    let lookup = tokio::spawn({
+        let authz = authz.clone();
+        async move { authz.guild(guild).await.map(|partial| partial.id.get()) }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A role change arrives while Discord is still answering with the old state.
+    cache.forget_guild(guild);
+    assert_eq!(lookup.await.unwrap(), Ok(guild));
+    // So the next request asks again instead of using that answer for five minutes.
+    authz.guild(guild).await.unwrap();
+    discord.verify().await;
+}
+
+/// A member as Discord REST returns it (serenity adds the guild ID).
+fn member(guild: u64, user: u64, roles: &[u64], change: impl FnOnce(&mut Value)) -> Member {
+    let mut value = member_json(user, roles);
+    value["guild_id"] = json!(guild);
+    change(&mut value);
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn timed_out_and_pending_members_get_no_rights() {
+    let (guild, owner, user) = (660_u64, 661_u64, 662_u64);
+    let (members_role, staff_role, admin_role) = (670_u64, 671_u64, 672_u64);
+    let partial: PartialGuild = serde_json::from_value(guild_json(
+        guild,
+        owner,
+        &[
+            role(members_role, "メンバー", 1, 0),
+            role(staff_role, "運営", 2, MANAGE_GUILD),
+            role(admin_role, "管理者", 3, ADMINISTRATOR),
+        ],
+    ))
+    .unwrap();
+    let settings = GuildAccess {
+        allowed: true,
+        use_roles: vec![members_role],
+        manage_roles: vec![],
+    };
+    let decide = |roles: &[u64], change: fn(&mut Value)| {
+        authz::decide(&settings, &partial, &member(guild, user, roles, change))
+    };
+    let everything = Access {
+        use_bot: true,
+        manage_knowledge: true,
+        configure: true,
+    };
+    let staff = [members_role, staff_role];
+    assert_eq!(decide(&staff, |_| {}), everything);
+    let timed_out = |member: &mut Value| {
+        member["communication_disabled_until"] = json!("2099-01-01T00:00:00.000000+00:00")
+    };
+    let pending = |member: &mut Value| member["pending"] = json!(true);
+    let ended = |member: &mut Value| {
+        member["communication_disabled_until"] = json!("2020-01-01T00:00:00.000000+00:00")
+    };
+    assert_eq!(decide(&staff, timed_out), Access::default());
+    assert_eq!(decide(&staff, pending), Access::default());
+    assert_eq!(decide(&staff, ended), everything);
+    // Discord does not apply timeouts to administrators.
+    let admin = [members_role, admin_role];
+    assert_eq!(decide(&admin, timed_out), everything);
+}
+
+#[tokio::test]
 async fn slow_or_failing_discord_is_unavailable_and_not_cached() {
     let discord = MockServer::start().await;
     Mock::given(path("/api/v10/guilds/700/members/701"))
@@ -710,25 +967,6 @@ async fn slow_or_failing_discord_is_unavailable_and_not_cached() {
 }
 
 // ---- Database tests (compose.test.yaml) ----
-
-async fn database() -> Database {
-    let url = std::env::var("TEST_DATABASE_URL")
-        .expect("set TEST_DATABASE_URL to the disposable discussion_test database");
-    let options: MySqlConnectOptions = url.parse().unwrap();
-    assert_eq!(
-        options.get_database(),
-        Some("discussion_test"),
-        "never use a production database for these tests"
-    );
-    let pool = Database::pool_options()
-        .max_connections(3)
-        .connect_with(options.disable_statement_logging())
-        .await
-        .unwrap();
-    let db = Database { pool };
-    db.migrate().await.unwrap();
-    db
-}
 
 async fn clear_user(db: &Database, user: u64) {
     sqlx::query("DELETE FROM web_sessions WHERE user_id=?")
@@ -771,8 +1009,14 @@ async fn web_sessions() {
     assert_eq!(session.user_id, user);
     assert_eq!(session.user_name, "テスト");
     assert_eq!(session.guilds, guilds);
+    let expires_at: chrono::NaiveDateTime =
+        sqlx::query_scalar("SELECT expires_at FROM web_sessions WHERE user_id=?")
+            .bind(user)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(
-        session.expires_at.timestamp_millis(),
+        expires_at.and_utc().timestamp_millis(),
         (now + chrono::Duration::days(7)).timestamp_millis()
     );
     // Only the hash is stored.
@@ -849,6 +1093,55 @@ async fn web_sessions() {
     assert!(!remaining.contains(&expired.to_vec()));
     clear_user(&db, user).await;
     clear_user(&db, other).await;
+}
+
+#[tokio::test]
+#[ignore = "requires compose.test.yaml and TEST_DATABASE_URL"]
+async fn concurrent_logins_of_one_user_all_succeed() {
+    let db = database().await;
+    let user = 950_001_u64;
+    clear_user(&db, user).await;
+    let mut logins = tokio::task::JoinSet::new();
+    for _ in 0..12 {
+        let db = db.clone();
+        logins.spawn(async move {
+            let hash = security::hash(&security::new_token());
+            db.create_session(&hash, user, "u", &[], Utc::now()).await
+        });
+    }
+    for result in logins.join_all().await {
+        result.unwrap();
+    }
+    // Trimming may lag behind concurrent logins, but the next login catches up.
+    db.create_session(
+        &security::hash(&security::new_token()),
+        user,
+        "u",
+        &[],
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions WHERE user_id=?")
+        .bind(user)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, MAX_SESSIONS_PER_USER as i64);
+    clear_user(&db, user).await;
+}
+
+#[tokio::test]
+#[ignore = "requires compose.test.yaml and TEST_DATABASE_URL"]
+async fn healthz_reports_database_and_gateway() {
+    let state = state(database().await, "http://127.0.0.1:9");
+    let (status, _, body) = send(&state, get("/healthz")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"ok");
+    state.discord_ready.store(false, Ordering::Relaxed);
+    let (status, _, body) = send(&state, get("/healthz")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(&body[..], b"unavailable");
 }
 
 #[tokio::test]
@@ -945,6 +1238,21 @@ async fn web_login_keeps_only_allowlisted_guilds() {
     let session_cookie = cookies[1].split(';').next().unwrap().to_owned();
     assert!(session_cookie.starts_with("__Host-session="));
     assert!(cookies[1].ends_with("; Max-Age=604800; Path=/; HttpOnly; SameSite=Lax; Secure"));
+    // What the session stores, not what /api/me shows: /api/me hides guilds the bot is not in
+    // or that are not allowlisted anyway, so only this shows that login filtered them.
+    let token = security::decode(session_cookie.split_once('=').unwrap().1).unwrap();
+    let stored = db
+        .session(&security::hash(&token), Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.guilds,
+        [SessionGuild {
+            id: allowed,
+            name: "許可済み".into()
+        }]
+    );
 
     let (status, _, body) = send(
         &state,
@@ -1034,12 +1342,15 @@ async fn web_role_settings() {
     let discord = MockServer::start().await;
     mock_member(&discord, guild, manager, &[staff], 1).await;
     mock_member(&discord, guild, member, &[readers], 1).await;
-    // Neither absent guild (bot not in it) nor anything else may reach Discord.
-    Mock::given(path(format!("/api/v10/guilds/{absent}")))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
-        .mount(&discord)
-        .await;
+    // Nothing about the absent guild (bot not in it) or one outside the session may reach
+    // Discord: neither the guild nor any member lookup.
+    Mock::given(path_regex(format!(
+        "^/api/v10/guilds/({absent}|930999)(/.*)?$"
+    )))
+    .respond_with(ResponseTemplate::new(500))
+    .expect(0)
+    .mount(&discord)
+    .await;
     let roles = [
         role(staff, "運営", 3, MANAGE_GUILD),
         role(readers, "読者", 2, 0),
@@ -1199,6 +1510,24 @@ async fn web_role_settings() {
             manage_roles: vec![],
         }
     );
+
+    // `ops guild deny` cuts off sessions that already exist, without asking Discord (the
+    // mocks' call counts are checked when the server is dropped).
+    assert!(db.deny_guild(guild).await.unwrap());
+    let (status, _, _) = send(&state, get_roles(guild, manager_cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let request = put_roles(guild, manager_cookie, json!({"use": [], "manage": []}));
+    assert_eq!(send(&state, request).await.0, StatusCode::NOT_FOUND);
+    let (status, _, body) = send(
+        &state,
+        Request::get("/api/me")
+            .header(header::COOKIE, manager_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&body)["guilds"], json!([]));
     for user in [manager, member] {
         clear_user(&db, user).await;
     }

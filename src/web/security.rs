@@ -18,7 +18,7 @@ use super::{ApiError, AppState};
 
 /// No inline scripts or styles anywhere, and nothing loaded from other origins (images included,
 /// so injected markup cannot send data out through image URLs).
-pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 pub async fn headers(request: Request, next: Next) -> Response {
     let private = {

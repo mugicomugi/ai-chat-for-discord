@@ -38,6 +38,11 @@ pub type BotGuilds = Arc<RwLock<HashSet<u64>>>;
 /// Largest request body; the settings API only takes small JSON documents.
 const MAX_BODY_BYTES: usize = 16 * 1024;
 
+/// Shared by the API and the login pages.
+const DATABASE_UNAVAILABLE: &str =
+    "データベースに接続できませんでした。時間をおいて再試行してください。";
+const INTERNAL_ERROR: &str = "内部エラーが発生しました。時間をおいて再試行してください。";
+
 /// What the web server shares with the Discord side of the process.
 pub struct Shared {
     pub db: Database,
@@ -45,7 +50,8 @@ pub struct Shared {
     pub limits: Arc<Limits>,
     pub http: Arc<Http>,
     pub bot_guilds: BotGuilds,
-    /// True while the gateway connection is up (for /healthz).
+    /// True while every gateway shard is connected (for /healthz); see
+    /// `discord::watch_gateway`.
     pub discord_ready: Arc<AtomicBool>,
     pub discord_cache: Arc<authz::DiscordCache>,
 }
@@ -203,10 +209,8 @@ impl ApiError {
             Self::DiscordUnavailable => {
                 "Discord から情報を取得できませんでした。時間をおいて再試行してください。"
             }
-            Self::Database => {
-                "データベースに接続できませんでした。時間をおいて再試行してください。"
-            }
-            Self::Internal => "内部エラーが発生しました。時間をおいて再試行してください。",
+            Self::Database => DATABASE_UNAVAILABLE,
+            Self::Internal => INTERNAL_ERROR,
         }
     }
 }

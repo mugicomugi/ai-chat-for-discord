@@ -124,7 +124,7 @@
 
    > **M1 より前のイメージに戻すと、サーバーの許可リストとロールによる利用制限が効かなくなります。** Bot を追加しているサーバーの全員が `/talk` を使える状態に戻ります。DB の設定は残るので、M1 以降のイメージに戻せば再び有効になります。
 
-   > **M2 より前のイメージに戻すと、Web 管理画面は止まります**（Caddy は動き続け、502 を返します）。ログイン中のセッションは DB に残り、M2 以降のイメージに戻せばそのまま使えます。
+   > **M2 より前のイメージに戻すと、Web 管理画面は止まります**（Caddy は動き続け、502 を返します）。ログイン中のセッションは DB に残り、M2 以降のイメージに戻せばそのまま使えます。Docker のヘルスチェックも M2 のイメージから入ったものなので、古いイメージでは `docker compose ps` に health が表示されません。
 
 **M0 以前のイメージ（`docker compose up --build` でビルドしていた頃のもの）に戻す場合**は、`deploy.sh` が受け付けないタグなので、次のように戻します。
 
@@ -246,7 +246,14 @@ age -d -i discussion-backup-identity.txt discussion-XXXX.sql.zst.age | zstd -d \
   | ssh <vm> 'cd ai-chat-for-discord && sudo docker compose exec -T db sh -c '\''MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE"'\'''
 ```
 
-**復元した後は**、「6. 削除依頼への対応」の台帳にある削除を、もう一度すべて適用します。
+**復元した後は**、Bot を起動する前に次の 2 つを行います。
+
+1. 「6. 削除依頼への対応」の台帳にある削除を、もう一度すべて適用する。
+2. Web 管理画面のログインをすべて消す（バックアップの時点で有効だったセッションが復活し、その後にログアウトしたものや、漏えいのため全員をログアウトさせたものも再び使えてしまうため）。利用者はもう一度ログインすれば使えます。
+
+   ```bash
+   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM web_sessions"'
+   ```
 
 ## 6. 削除依頼への対応
 
@@ -358,7 +365,7 @@ sudo bash -c 'set -euo pipefail; set -a; . ./.env; set +a
   - バックアップの鮮度（26 時間超）
   - TLS 証明書の期限（`DOMAIN` を設定した後）
 - 状態の確認: `systemctl list-timers 'discussion-bot-*'`、`journalctl -u discussion-bot-healthwatch -n 50`
-- Bot コンテナには Docker のヘルスチェック（`/app/bot healthcheck`、30 秒ごと）があり、Web 管理画面を有効にしていると DB と Discord への接続を確かめます（無効なら常に healthy）。unhealthy になると healthwatch が通知します。
+- Bot コンテナには Docker のヘルスチェック（`/app/bot healthcheck`、30 秒ごと）があり、Web 管理画面を有効にしていると DB と Discord への接続を確かめます（無効なら常に healthy）。unhealthy になると healthwatch が通知します。ヘルスチェックは `compose.yaml` ではなくイメージ（`Dockerfile`）に入っているので、M2 より前のイメージに切り戻すとヘルスチェックなしで動きます（古いバイナリは `healthcheck` を通常の起動として扱うため、`compose.yaml` に書いてはいけません）。
 - Web 管理画面の公開後は、外部の死活監視サービスから `https://<ドメイン>/healthz` を監視します（「12. Web 管理画面を公開する」）。
 
 ## 12. Web 管理画面を公開する
@@ -414,4 +421,4 @@ Discord でログインしてロールを設定できる画面（README の「We
 - **証明書**: `caddy_data` ボリュームに保存されます。消すと再取得になり、Let's Encrypt の発行回数の上限に当たることがあるので、`docker compose down -v` は使いません。
 - **Client Secret の交換**: Developer Portal で Reset Secret し、`.env` を書き換えて `sudo scripts/deploy.sh "$(sed -n 's/^BOT_IMAGE=//p' .env)"`。ログイン中のセッションはそのまま使えます。
 - **全員をログアウトさせる**: `sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM web_sessions"'`
-- **公開をやめる**: `.env` の 3 つの変数を空にして `COMPOSE_PROFILES` を消し、Bot を作り直す（上の deploy.sh）。続けて `sudo docker compose --profile web stop caddy` と `sudo docker compose --profile web rm -f caddy` で Caddy を止め、OCI のセキュリティリストから 80/443 を外す。
+- **公開をやめる**: `.env` の 3 つの変数を空にして `COMPOSE_PROFILES` を消し、Bot を作り直す（上の deploy.sh）。続けて `sudo docker compose --profile web stop caddy` と `sudo docker compose --profile web rm -f caddy` で Caddy を止め、OCI のセキュリティリストから 80/443 を外す。最後に `sudoedit /etc/discussion-bot/ops.env` で `DOMAIN=""` にする（残っていると、healthwatch が証明書を確認できないという通知を 6 時間ごとに送り続けます）。

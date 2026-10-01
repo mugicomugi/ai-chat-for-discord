@@ -4,9 +4,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
 COPY src ./src
 COPY migrations ./migrations
-# Compiled into the binary: the web UI's files and the privacy policy / terms pages.
+# Compiled into the binary: the web UI's files and the privacy policy / terms pages. Only these
+# two documents, so editing the runbook does not invalidate the build cache.
 COPY static ./static
-COPY docs ./docs
+COPY docs/privacy.md docs/terms.md ./docs/
 
 FROM source AS build
 # .cargo/config.toml keeps local Docker Desktop builds at one job; CI raises it.
@@ -29,6 +30,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 USER 10001:10001
 ENTRYPOINT ["/app/bot"]
+# GET /healthz (database and Discord gateway); always healthy while the web UI is off. Defined
+# here rather than in compose.yaml: binaries before M2 treat `healthcheck` as a normal start, so
+# compose must not run it against an image rolled back to.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/app/bot", "healthcheck"]
 
 # Image with a binary compiled on the production VM by scripts/build-image.sh, which passes it
 # as the named build context "prebuilt" (target/ is excluded from the main context).

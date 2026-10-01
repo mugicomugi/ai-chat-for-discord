@@ -25,3 +25,10 @@ updates:
       # refreshes come through here (keep compose.yaml and compose.test.yaml in step).
       - dependency-name: mariadb
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+  # The browser libraries vendored in static/vendor/ (DOMPurify is the web UI's XSS defence).
+  # A pull request bumps package.json only; copy the new files as static/vendor/LICENSES.txt
+  # describes, or the version check in src/web/assets.rs fails.
+  - package-ecosystem: npm
+    directory: /static/vendor
+    schedule:
+      interval: weekly

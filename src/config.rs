@@ -78,7 +78,7 @@ impl WebConfig {
         {
             bail!("DISCORD_CLIENT_ID must be the numeric application ID");
         }
-        if client_secret.starts_with("replace_") || client_secret.starts_with("your_") {
+        if is_placeholder(&client_secret) {
             bail!("DISCORD_CLIENT_SECRET is still a placeholder");
         }
         let bind = set(bind).unwrap_or_else(|| DEFAULT_WEB_BIND.into());
@@ -149,8 +149,13 @@ impl Config {
 fn required(name: &str) -> Result<String> {
     env::var(name)
         .ok()
-        .filter(|v| !v.trim().is_empty() && !v.starts_with("replace_"))
+        .filter(|v| !v.trim().is_empty() && !is_placeholder(v))
         .with_context(|| format!("{name} is missing or still a placeholder"))
+}
+
+/// The example values of .env.example (`your_…`) and older templates (`replace_…`).
+fn is_placeholder(value: &str) -> bool {
+    value.starts_with("your_") || value.starts_with("replace_")
 }
 
 fn number<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
@@ -167,6 +172,18 @@ mod tests {
     fn web(id: &str, secret: &str, url: &str, bind: &str) -> Result<Option<WebConfig>> {
         let value = |v: &str| Some(v.to_owned());
         WebConfig::from_values(value(id), value(secret), value(url), value(bind))
+    }
+
+    #[test]
+    fn example_values_are_placeholders() {
+        for value in [
+            "your_discord_bot_token",
+            "your_long_random_password",
+            "replace_me",
+        ] {
+            assert!(is_placeholder(value), "{value}");
+        }
+        assert!(!is_placeholder("MTIz.secret"));
     }
 
     #[test]
@@ -218,6 +235,7 @@ mod tests {
         }
         assert!(web("abc", "s", "https://bot.example", "").is_err());
         assert!(web("1", "replace_me", "https://bot.example", "").is_err());
+        assert!(web("1", "your_client_secret", "https://bot.example", "").is_err());
         assert!(web("1", "s", "https://bot.example", "8080").is_err());
     }
 }

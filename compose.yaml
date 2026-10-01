@@ -31,13 +31,8 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       # Caddy proxies to bot:8080; the port is not published on the host.
       WEB_BIND: 0.0.0.0:8080
-    # GET /healthz (database and Discord gateway); always healthy while the web UI is off.
-    healthcheck:
-      test: [CMD, /app/bot, healthcheck]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+    # The health check (`/app/bot healthcheck`) is part of the image (Dockerfile), so images
+    # older than M2 run without one after a rollback. Do not add `healthcheck:` here.
     depends_on:
       db:
         condition: service_healthy

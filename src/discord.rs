@@ -8,6 +8,7 @@ use std::{
 
 use chrono::{DateTime, Duration, Utc};
 use serenity::{all::*, async_trait};
+use tokio::sync::watch;
 
 use crate::{
     access::{self, Access, GuildAccess, MAX_ROLES_PER_KIND, RoleKind, role_mention},
@@ -29,8 +30,6 @@ pub struct Handler {
     pub registered: AtomicBool,
     /// The guilds the bot is in; the web UI only offers these.
     pub bot_guilds: BotGuilds,
-    /// Whether the gateway is connected (the web UI's /healthz).
-    pub discord_ready: Arc<AtomicBool>,
     /// The web UI's cache of guild data, dropped when roles or the guild change.
     pub discord_cache: Arc<DiscordCache>,
 }
@@ -166,7 +165,6 @@ impl EventHandler for Handler {
         // A new session lists every guild the bot is in (as unavailable until GUILD_CREATE).
         *self.bot_guilds.write().expect("bot guild lock poisoned") =
             ready.guilds.iter().map(|guild| guild.id.get()).collect();
-        self.discord_ready.store(true, Ordering::Relaxed);
         if self.registered.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -208,15 +206,6 @@ impl EventHandler for Handler {
             "config" => self.config(&ctx, &command).await,
             _ => {}
         }
-    }
-
-    async fn shard_stage_update(&self, _ctx: Context, event: ShardStageUpdateEvent) {
-        self.discord_ready
-            .store(event.new == ConnectionStage::Connected, Ordering::Relaxed);
-    }
-
-    async fn resume(&self, _ctx: Context, _event: ResumedEvent) {
-        self.discord_ready.store(true, Ordering::Relaxed);
     }
 
     async fn guild_create(&self, _ctx: Context, guild: Guild, _is_new: Option<bool>) {
@@ -283,6 +272,39 @@ impl EventHandler for Handler {
             Err(_) => tracing::warn!(guild_id = guild_id.get(), "deleted_role_cleanup_failed"),
         }
     }
+}
+
+/// Keeps `ready` (the web UI's /healthz) equal to "every shard is connected" until `stop`.
+/// Gateway events cannot tell: serenity restarts a shard without a stage event after a missed
+/// heartbeat ACK, op 9 or a failed resume, and retries a failing reconnect silently. Its runner
+/// table drops the shard on restart and only lists it as connected after READY.
+pub async fn watch_gateway(
+    manager: Arc<ShardManager>,
+    ready: Arc<AtomicBool>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = async { let _ = stop.wait_for(|stop| *stop).await; } => return,
+        }
+        let stages: Vec<ConnectionStage> = manager
+            .runners
+            .lock()
+            .await
+            .values()
+            .map(|runner| runner.stage)
+            .collect();
+        ready.store(all_connected(&stages), Ordering::Relaxed);
+    }
+}
+
+fn all_connected(stages: &[ConnectionStage]) -> bool {
+    !stages.is_empty()
+        && stages
+            .iter()
+            .all(|stage| *stage == ConnectionStage::Connected)
 }
 
 impl Handler {
@@ -822,6 +844,12 @@ mod tests {
             .collect();
         assert_eq!(choices, ["use", "manage"]);
         let mentions = serde_json::to_value(no_mentions()).unwrap();
+        assert_eq!(mentions["parse"], serde_json::json!([]));
+        assert_eq!(mentions["replied_user"], false);
+    }
+
+    #[test]
+    fn settings_text_links_the_web_page_when_enabled() {
         let settings = GuildAccess {
             allowed: true,
             use_roles: vec![5],
@@ -831,7 +859,16 @@ mod tests {
         assert!(text.contains("<@&5>") && !text.contains("Web管理画面"));
         let text = describe_settings(7, &settings, Some("https://bot.example"));
         assert!(text.ends_with("<https://bot.example/#/guilds/7>"));
-        assert_eq!(mentions["parse"], serde_json::json!([]));
-        assert_eq!(mentions["replied_user"], false);
+    }
+
+    #[test]
+    fn the_gateway_counts_as_up_only_when_every_shard_is_connected() {
+        use ConnectionStage::*;
+        assert!(!all_connected(&[]));
+        assert!(all_connected(&[Connected]));
+        assert!(all_connected(&[Connected, Connected]));
+        for stage in [Disconnected, Handshake, Identifying, Connecting, Resuming] {
+            assert!(!all_connected(&[Connected, stage]), "{stage:?}");
+        }
     }
 }

@@ -1,25 +1,31 @@
 //! Discord OAuth2 login and web sessions. The user's Discord token is used only to read who
 //! they are and which guilds they are in, then revoked at once; it is never stored.
 
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{FromRequestParts, Query, State},
-    http::{HeaderMap, StatusCode, header, request::Parts},
+    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     response::{IntoResponse, Redirect, Response},
 };
 use chrono::Utc;
 use reqwest::{Client, StatusCode as UpstreamStatus};
 use serde::{Deserialize, de::DeserializeOwned};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use super::{
-    ApiError, AppState, Web, assets,
-    security::{cookie, decode, encode, equal, hash, new_token},
+    ApiError, AppState, DATABASE_UNAVAILABLE, INTERNAL_ERROR, Web, assets,
+    security::{Token, cookie, decode, encode, equal, hash, new_token},
 };
 use crate::{
+    bounded::{self, BodyError},
     config::WebConfig,
-    db::{SESSION_DAYS, SessionGuild, parse_snowflake},
+    db::{SESSION_DAYS, SessionGuild},
+    ids::parse_snowflake,
 };
 
 const AUTHORIZE_URL: &str = "https://discord.com/oauth2/authorize";
@@ -28,11 +34,19 @@ const STATE_COOKIE_SECONDS: u64 = 600;
 const GUILD_PAGE: usize = 200;
 const MAX_GUILD_PAGES: usize = 5;
 const MAX_RESPONSE_BYTES: usize = 1_000_000;
+/// Logins that may talk to Discord at the same time, and per minute. The callback needs no
+/// account and its state check is a double submit any script can pass, while every login calls
+/// Discord from the bot's IP: enough 429s there get the IP banned from the whole Discord API
+/// (gateway and /talk included), so a flood is refused here instead.
+const LOGIN_CONCURRENCY: usize = 2;
+const LOGINS_PER_MINUTE: u32 = 20;
+/// The pause after a 429 without a usable Retry-After, and the longest one honoured.
+const DEFAULT_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_BACKOFF: Duration = Duration::from_secs(600);
 
 /// A logged-in user, from the session cookie. Rejects with 401 otherwise.
 #[derive(Debug, Clone)]
 pub struct Session {
-    pub token_hash: [u8; 32],
     pub user_id: u64,
     pub user_name: String,
     /// Allowlisted guilds the user was in at login.
@@ -46,15 +60,13 @@ impl FromRequestParts<AppState> for Session {
         let token = cookie(&parts.headers, state.cookies.session())
             .and_then(decode)
             .ok_or(ApiError::Unauthenticated)?;
-        let token_hash = hash(&token);
         let session = state
             .db
-            .session(&token_hash, Utc::now())
+            .session(&hash(&token), Utc::now())
             .await
             .map_err(|_| ApiError::Database)?
             .ok_or(ApiError::Unauthenticated)?;
         Ok(Self {
-            token_hash,
             user_id: session.user_id,
             user_name: session.user_name,
             guilds: session.guilds,
@@ -122,24 +134,34 @@ pub async fn callback(
     if expected.is_empty() || !equal(expected.as_bytes(), received.as_bytes()) || code.len() > 512 {
         return fail(StatusCode::BAD_REQUEST, LOGIN_EXPIRED);
     }
-    let token = match start_session(&state, code).await {
+    let result = match state.oauth.admit() {
+        // Refusals are not logged one by one: the gate reports floods itself.
+        Err(wait) => Err(LoginError::Throttled(wait)),
+        Ok(permit) => {
+            // Detached from the request, so a browser that goes away mid-login does not stop
+            // the revocation of the user's Discord token.
+            let (state, code) = (state.clone(), code.clone());
+            tokio::spawn(async move {
+                let _permit = permit;
+                start_session(&state, &code).await
+            })
+            .await
+            .unwrap_or(Err(LoginError::Internal))
+            .inspect_err(|error| tracing::warn!(error_code = %error, "web_login_failed"))
+        }
+    };
+    let token = match result {
         Ok(token) => token,
         Err(error) => {
-            tracing::warn!(error_code = %error, "web_login_failed");
-            return match error {
-                LoginError::OAuth(OAuthError::Rejected) => fail(
-                    StatusCode::BAD_REQUEST,
-                    "Discord でのログインに失敗しました。もう一度ログインしてください。",
-                ),
-                LoginError::OAuth(_) => fail(
-                    StatusCode::BAD_GATEWAY,
-                    "Discord と通信できませんでした。時間をおいて再試行してください。",
-                ),
-                LoginError::Database => fail(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "データベースに接続できませんでした。時間をおいて再試行してください。",
-                ),
-            };
+            let mut response = fail(error.status(), error.user_message());
+            if let Some(wait) = error.retry_after() {
+                // Whole seconds, rounded up.
+                let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from(seconds.max(1)));
+            }
+            return response;
         }
     };
     // A new token on every login (session fixation); the session it replaces is dropped.
@@ -162,19 +184,59 @@ pub async fn callback(
 
 #[derive(Debug, thiserror::Error)]
 enum LoginError {
+    /// Refused locally by the login gate.
+    #[error("login_throttled")]
+    Throttled(Duration),
     #[error(transparent)]
     OAuth(#[from] OAuthError),
     #[error("database")]
     Database,
+    #[error("internal")]
+    Internal,
+}
+
+impl LoginError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Throttled(_) | Self::OAuth(OAuthError::RateLimit(_)) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::OAuth(OAuthError::Rejected) => StatusCode::BAD_REQUEST,
+            Self::OAuth(_) => StatusCode::BAD_GATEWAY,
+            Self::Database | Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn user_message(&self) -> &'static str {
+        match self {
+            Self::Throttled(_) | Self::OAuth(OAuthError::RateLimit(_)) => {
+                "ログインが混み合っています。しばらくしてから再試行してください。"
+            }
+            Self::OAuth(OAuthError::Rejected) => {
+                "Discord でのログインに失敗しました。もう一度ログインしてください。"
+            }
+            Self::OAuth(_) => "Discord と通信できませんでした。時間をおいて再試行してください。",
+            Self::Database => DATABASE_UNAVAILABLE,
+            Self::Internal => INTERNAL_ERROR,
+        }
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Throttled(wait) | Self::OAuth(OAuthError::RateLimit(wait)) => Some(*wait),
+            _ => None,
+        }
+    }
 }
 
 /// Exchanges the code, reads the user and their guilds, revokes the user token and stores a
 /// session limited to allowlisted guilds. Returns the new session token.
-async fn start_session(state: &Web, code: &str) -> Result<super::security::Token, LoginError> {
+async fn start_session(state: &Web, code: &str) -> Result<Token, LoginError> {
     let token = state
         .oauth
         .exchange(code, &state.config.redirect_uri())
         .await?;
+    // Revoked whatever happens next: the fetches and the database are only touched after it.
     let fetched = async {
         let user = state.oauth.user(&token).await?;
         let guilds = state.oauth.guilds(&token).await?;
@@ -227,8 +289,9 @@ pub enum OAuthError {
     /// Discord refused the code or the client credentials.
     #[error("oauth_rejected")]
     Rejected,
+    /// Discord answered 429; carries how long to wait.
     #[error("discord_rate_limit")]
-    RateLimit,
+    RateLimit(Duration),
     #[error("discord_upstream")]
     Upstream,
     #[error("discord_network")]
@@ -247,12 +310,87 @@ pub struct DiscordUser {
     pub name: String,
 }
 
-/// Discord's OAuth2 endpoints, called with the application's client credentials.
+/// Discord's OAuth2 endpoints, called with the application's client credentials. Logins go
+/// through `admit` first, and any 429 pauses new ones.
 pub struct OAuthClient {
     client: Client,
     api: String,
     client_id: String,
     client_secret: String,
+    gate: LoginGate,
+}
+
+/// Process-wide limits on logins (single replica, so memory is enough).
+struct LoginGate {
+    permits: Arc<Semaphore>,
+    state: Mutex<GateState>,
+}
+
+struct GateState {
+    window_start: Instant,
+    admitted: u32,
+    blocked_until: Option<Instant>,
+    refused: u64,
+    reported_at: Option<Instant>,
+}
+
+impl LoginGate {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(LOGIN_CONCURRENCY)),
+            state: Mutex::new(GateState {
+                window_start: Instant::now(),
+                admitted: 0,
+                blocked_until: None,
+                refused: 0,
+                reported_at: None,
+            }),
+        }
+    }
+
+    fn admit(&self) -> Result<OwnedSemaphorePermit, Duration> {
+        let now = Instant::now();
+        let mut state = self.state.lock().expect("login gate poisoned");
+        let minute = Duration::from_secs(60);
+        if now.duration_since(state.window_start) >= minute {
+            state.window_start = now;
+            state.admitted = 0;
+        }
+        let wait = if let Some(until) = state.blocked_until.filter(|until| *until > now) {
+            until - now
+        } else if state.admitted >= LOGINS_PER_MINUTE {
+            state.window_start + minute - now
+        } else {
+            match self.permits.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    state.admitted += 1;
+                    return Ok(permit);
+                }
+                // A login takes about a second.
+                Err(_) => Duration::from_secs(2),
+            }
+        };
+        state.refused += 1;
+        if state
+            .reported_at
+            .is_none_or(|at| now.duration_since(at) >= minute)
+        {
+            tracing::warn!(refused = state.refused, "web_login_throttled");
+            state.refused = 0;
+            state.reported_at = Some(now);
+        }
+        Err(wait)
+    }
+
+    fn back_off(&self, wait: Duration) {
+        let until = Instant::now() + wait;
+        let mut state = self.state.lock().expect("login gate poisoned");
+        state.blocked_until = Some(
+            state
+                .blocked_until
+                .map_or(until, |current| current.max(until)),
+        );
+    }
 }
 
 impl OAuthClient {
@@ -266,7 +404,13 @@ impl OAuthClient {
             api: config.discord_api.trim_end_matches('/').to_owned(),
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
+            gate: LoginGate::new(),
         })
+    }
+
+    /// A permit for one login's Discord calls (held until they finish), or how long to wait.
+    pub fn admit(&self) -> Result<OwnedSemaphorePermit, Duration> {
+        self.gate.admit()
     }
 
     pub async fn exchange(&self, code: &str, redirect_uri: &str) -> Result<UserToken, OAuthError> {
@@ -286,7 +430,7 @@ impl OAuthClient {
             .send()
             .await
             .map_err(|_| OAuthError::Network)?;
-        let token: TokenResponse = read_json(response).await?;
+        let token: TokenResponse = self.read_json(response).await?;
         Ok(UserToken(token.access_token))
     }
 
@@ -353,7 +497,7 @@ impl OAuthClient {
             .send()
             .await
             .map_err(|_| OAuthError::Network)?;
-        check(response.status())
+        self.check(&response)
     }
 
     async fn get<T: DeserializeOwned>(
@@ -368,33 +512,55 @@ impl OAuthClient {
             .send()
             .await
             .map_err(|_| OAuthError::Network)?;
-        read_json(response).await
+        self.read_json(response).await
     }
-}
 
-fn check(status: UpstreamStatus) -> Result<(), OAuthError> {
-    match status {
-        status if status.is_success() => Ok(()),
-        UpstreamStatus::TOO_MANY_REQUESTS => Err(OAuthError::RateLimit),
-        status if status.is_client_error() => Err(OAuthError::Rejected),
-        _ => Err(OAuthError::Upstream),
-    }
-}
-
-async fn read_json<T: DeserializeOwned>(mut response: reqwest::Response) -> Result<T, OAuthError> {
-    if let Err(error) = check(response.status()) {
+    /// A 429 also pauses new logins for as long as Discord asks.
+    fn check(&self, response: &reqwest::Response) -> Result<(), OAuthError> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
         tracing::warn!(
-            http_status = response.status().as_u16(),
+            http_status = status.as_u16(),
             "discord_oauth_request_failed"
         );
-        return Err(error);
+        Err(match status {
+            UpstreamStatus::TOO_MANY_REQUESTS => {
+                let wait = retry_after(response.headers());
+                self.gate.back_off(wait);
+                OAuthError::RateLimit(wait)
+            }
+            status if status.is_client_error() => OAuthError::Rejected,
+            _ => OAuthError::Upstream,
+        })
     }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| OAuthError::Network)? {
-        if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err(OAuthError::InvalidResponse);
-        }
-        bytes.extend_from_slice(&chunk);
+
+    async fn read_json<T: DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<T, OAuthError> {
+        self.check(&response)?;
+        bounded::json(response, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                BodyError::Transport(_) => OAuthError::Network,
+                BodyError::Invalid => OAuthError::InvalidResponse,
+            })
     }
-    serde_json::from_slice(&bytes).map_err(|_| OAuthError::InvalidResponse)
+}
+
+/// Discord's wait in seconds (`Retry-After`, else `X-RateLimit-Reset-After`), within bounds.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
+    [
+        reqwest::header::RETRY_AFTER.as_str(),
+        "x-ratelimit-reset-after",
+    ]
+    .into_iter()
+    .filter_map(|name| headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok())
+    .find(|seconds| seconds.is_finite() && *seconds >= 0.0)
+    .map_or(DEFAULT_BACKOFF, |seconds| {
+        Duration::from_secs_f64(seconds.min(MAX_BACKOFF.as_secs_f64()))
+    })
+    .clamp(Duration::from_secs(1), MAX_BACKOFF)
 }

@@ -57,8 +57,14 @@ jobs:
         run: cargo test --locked --test database persistence_after_restart -- --ignored --exact
       - name: Guild access test
         run: cargo test --locked --test database access_and_guilds -- --ignored --exact
+      - name: Concurrent role settings test
+        run: cargo test --locked --test database guild_role_writes_are_serialized -- --ignored --exact
       - name: Web session test
         run: cargo test --locked --test web web_sessions -- --ignored --exact
+      - name: Concurrent web login test
+        run: cargo test --locked --test web concurrent_logins_of_one_user_all_succeed -- --ignored --exact
+      - name: Health check test
+        run: cargo test --locked --test web healthz_reports_database_and_gateway -- --ignored --exact
       - name: Web login test
         run: cargo test --locked --test web web_login_keeps_only_allowlisted_guilds -- --ignored --exact
       - name: Web role settings test

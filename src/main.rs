@@ -9,7 +9,7 @@ use discord_discussion_bot::{
     agent::Agent,
     config::Config,
     db::{Database, migrate_error_summary},
-    discord::Handler,
+    discord::{self, Handler},
     limits::Limits,
     ops,
     web::{self, BotGuilds, authz::DiscordCache},
@@ -76,7 +76,6 @@ async fn run() -> Result<()> {
     .context("HTTP client initialization failed")?;
     let limits = Arc::new(Limits::new(4));
     let bot_guilds = BotGuilds::default();
-    let discord_ready = Arc::new(AtomicBool::new(false));
     let discord_cache = Arc::new(DiscordCache::default());
     let handler = Handler {
         config: config.clone(),
@@ -85,7 +84,6 @@ async fn run() -> Result<()> {
         limits: limits.clone(),
         registered: AtomicBool::new(false),
         bot_guilds: bot_guilds.clone(),
-        discord_ready: discord_ready.clone(),
         discord_cache: discord_cache.clone(),
     };
     let mut client = Client::builder(
@@ -102,6 +100,7 @@ async fn run() -> Result<()> {
         let listener = tokio::net::TcpListener::bind(web_config.bind)
             .await
             .with_context(|| format!("web listener could not bind WEB_BIND={}", web_config.bind))?;
+        let discord_ready = Arc::new(AtomicBool::new(false));
         let state = web::Web::new(
             web_config.clone(),
             web::Shared {
@@ -111,11 +110,16 @@ async fn run() -> Result<()> {
                 // The bot's own REST client, so the web shares its rate-limit state.
                 http: client.http.clone(),
                 bot_guilds,
-                discord_ready,
+                discord_ready: discord_ready.clone(),
                 discord_cache,
             },
         )
         .context("HTTP client initialization failed")?;
+        tokio::spawn(discord::watch_gateway(
+            client.shard_manager.clone(),
+            discord_ready,
+            stopped.clone(),
+        ));
         tracing::info!(bind = %web_config.bind, "web_listening");
         web_server = Some(tokio::spawn(web::serve(listener, state, stopped.clone())));
     }
@@ -164,8 +168,7 @@ async fn maintenance(db: Database, retention_days: i64, mut stop: watch::Receive
             Err(_) => tracing::warn!("retention_cleanup_failed"),
         }
         match db.purge_sessions(now).await {
-            Ok(0) => {}
-            Ok(deleted) => tracing::info!(deleted, "expired_sessions_purged"),
+            Ok(deleted) => tracing::info!(deleted, "session_cleanup"),
             Err(_) => tracing::warn!("session_cleanup_failed"),
         }
     }

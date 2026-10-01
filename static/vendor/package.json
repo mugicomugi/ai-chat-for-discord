@@ -1,0 +1,9 @@
+{
+  "name": "discussion-bot-vendored-browser-libraries",
+  "private": true,
+  "description": "Pins the browser libraries copied into static/vendor/ so that Dependabot reports new versions and advisories. Nothing installs from this file: copy the files by hand as LICENSES.txt describes. A unit test (src/web/assets.rs) checks that the copies match these versions.",
+  "dependencies": {
+    "dompurify": "3.4.16",
+    "marked": "18.0.14"
+  }
+}

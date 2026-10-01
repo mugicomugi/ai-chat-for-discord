@@ -13,6 +13,7 @@ use crate::{
     agent::Answer,
     config::Config,
     history::{self, Entry},
+    ids::id_string,
 };
 
 #[derive(Clone)]
@@ -60,7 +61,6 @@ pub struct WebSession {
     pub user_name: String,
     /// Allowlisted guilds the user was a member of at login.
     pub guilds: Vec<SessionGuild>,
-    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,28 +68,6 @@ pub struct SessionGuild {
     #[serde(with = "id_string")]
     pub id: u64,
     pub name: String,
-}
-
-/// Discord IDs travel as JSON strings: JavaScript numbers lose precision above 2^53.
-pub mod id_string {
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S: Serializer>(id: &u64, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(id)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        super::parse_snowflake(&value).ok_or_else(|| D::Error::custom("invalid Discord ID"))
-    }
-}
-
-/// A nonzero Discord ID written in plain decimal digits (no sign, spaces or exponent).
-pub fn parse_snowflake(value: &str) -> Option<u64> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    value.parse().ok().filter(|id| *id != 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,11 +272,14 @@ impl Database {
         role: u64,
         created_by: Option<u64>,
     ) -> Result<RoleChange, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Concurrent adds (and web saves) would otherwise all pass the limit check.
+        lock_guild(&mut tx, guild).await?;
         let roles: Vec<u64> =
             sqlx::query_scalar("SELECT role_id FROM guild_roles WHERE guild_id=? AND kind=?")
                 .bind(guild)
                 .bind(kind.as_str())
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await?;
         if roles.contains(&role) {
             return Ok(RoleChange::AlreadyPresent);
@@ -308,7 +289,8 @@ impl Database {
         }
         let inserted = sqlx::query("INSERT IGNORE INTO guild_roles (guild_id,kind,role_id,created_at,created_by) VALUES (?,?,?,UTC_TIMESTAMP(3),?)")
             .bind(guild).bind(kind.as_str()).bind(role).bind(created_by)
-            .execute(&self.pool).await?.rows_affected();
+            .execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
         Ok(if inserted == 1 {
             RoleChange::Added
         } else {
@@ -359,26 +341,34 @@ impl Database {
         guilds: &[SessionGuild],
         now: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO web_sessions (token_hash,user_id,user_name,guilds,created_at,expires_at) VALUES (?,?,?,?,?,?)")
             .bind(token_hash.as_slice()).bind(user_id).bind(user_name).bind(sqlx::types::Json(guilds))
             .bind(now.naive_utc()).bind((now + chrono::Duration::days(SESSION_DAYS)).naive_utc())
-            .execute(&mut *tx).await?;
+            .execute(&self.pool).await?;
+        // Separate statements, not one transaction with the INSERT: two logins of the same user
+        // would each wait for the other's uncommitted row (a deadlock). Concurrent trims only
+        // delete the same rows twice; one that fails leaves an extra session until expiry.
+        if self.trim_sessions(user_id, now).await.is_err() {
+            tracing::warn!("session_trim_failed");
+        }
+        Ok(())
+    }
+
+    async fn trim_sessions(&self, user_id: u64, now: DateTime<Utc>) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM web_sessions WHERE user_id=? AND expires_at<=?")
             .bind(user_id)
             .bind(now.naive_utc())
-            .execute(&mut *tx)
+            .execute(&self.pool)
             .await?;
-        // A locking read: concurrent logins of the same user wait for each other here.
-        let hashes: Vec<Vec<u8>> = sqlx::query_scalar("SELECT token_hash FROM web_sessions WHERE user_id=? ORDER BY created_at DESC,token_hash DESC FOR UPDATE")
-            .bind(user_id).fetch_all(&mut *tx).await?;
+        let hashes: Vec<Vec<u8>> = sqlx::query_scalar("SELECT token_hash FROM web_sessions WHERE user_id=? ORDER BY created_at DESC,token_hash DESC")
+            .bind(user_id).fetch_all(&self.pool).await?;
         for hash in hashes.iter().skip(MAX_SESSIONS_PER_USER) {
             sqlx::query("DELETE FROM web_sessions WHERE token_hash=?")
                 .bind(hash)
-                .execute(&mut *tx)
+                .execute(&self.pool)
                 .await?;
         }
-        tx.commit().await
+        Ok(())
     }
 
     /// The unexpired session with this token hash.
@@ -387,8 +377,13 @@ impl Database {
         token_hash: &[u8; 32],
         now: DateTime<Utc>,
     ) -> Result<Option<WebSession>, sqlx::Error> {
-        let Some(row) = sqlx::query("SELECT user_id,user_name,guilds,expires_at FROM web_sessions WHERE token_hash=? AND expires_at>?")
-            .bind(token_hash.as_slice()).bind(now.naive_utc()).fetch_optional(&self.pool).await?
+        let Some(row) = sqlx::query(
+            "SELECT user_id,user_name,guilds FROM web_sessions WHERE token_hash=? AND expires_at>?",
+        )
+        .bind(token_hash.as_slice())
+        .bind(now.naive_utc())
+        .fetch_optional(&self.pool)
+        .await?
         else {
             return Ok(None);
         };
@@ -398,7 +393,6 @@ impl Database {
             guilds: row
                 .try_get::<sqlx::types::Json<Vec<SessionGuild>>, _>("guilds")?
                 .0,
-            expires_at: row.try_get::<NaiveDateTime, _>("expires_at")?.and_utc(),
         }))
     }
 
@@ -439,6 +433,7 @@ impl Database {
         changed_by: u64,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        lock_guild(&mut tx, guild).await?;
         let current =
             sqlx::query("SELECT kind,role_id FROM guild_roles WHERE guild_id=? FOR UPDATE")
                 .bind(guild)
@@ -469,6 +464,21 @@ impl Database {
     }
 }
 
+/// Serializes writers of one guild's role settings. Under READ COMMITTED a locking read of
+/// guild_roles takes no gap locks, so it neither blocks a save into a guild without roles nor
+/// sees rows another save inserted meanwhile. Lock order: the guilds row, then guild_roles. A
+/// guild without a row (`ops` before `allow`) has nothing to lock; only the operator writes it.
+async fn lock_guild(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    guild: u64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT guild_id FROM guilds WHERE guild_id=? FOR UPDATE")
+        .bind(guild)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Classifies a migration failure for logs without SQL text or driver messages. A `dirty`
 /// version means a DDL statement failed part-way (MariaDB DDL is not transactional); see the
 /// recovery steps in docs/runbook.md.
@@ -490,31 +500,6 @@ pub fn migrate_error_summary(error: &MigrateError) -> (&'static str, Option<i64>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn snowflakes_round_trip_as_strings() {
-        assert_eq!(parse_snowflake("18446744073709551615"), Some(u64::MAX));
-        for value in [
-            "",
-            "0",
-            "-1",
-            "+1",
-            " 1",
-            "1e3",
-            "18446744073709551616",
-            "１",
-        ] {
-            assert_eq!(parse_snowflake(value), None, "{value}");
-        }
-        let guild = SessionGuild {
-            id: 1_234_567_890_123_456_789,
-            name: "サーバー".into(),
-        };
-        let json = serde_json::to_string(&guild).unwrap();
-        assert_eq!(json, r#"{"id":"1234567890123456789","name":"サーバー"}"#);
-        assert_eq!(serde_json::from_str::<SessionGuild>(&json).unwrap(), guild);
-        assert!(serde_json::from_str::<SessionGuild>(r#"{"id":12,"name":"x"}"#).is_err());
-    }
 
     #[test]
     fn migrate_errors_are_summarized_without_messages() {

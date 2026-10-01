@@ -1,7 +1,8 @@
 Third-party files in static/vendor/, copied unmodified from the npm registry packages below
 (obtained with `npm pack <name>@<version>` from https://registry.npmjs.org/). To update, pack the
 new versions, compare the tarball integrity with `npm view <name>@<version> dist.integrity`,
-copy the same files and update this list.
+copy the same files and update this list and the versions in package.json (Dependabot proposes
+new versions there; its pull request is complete only once the files are copied too).
 
 marked.min.js
   package:   marked@18.0.14 (MIT License)

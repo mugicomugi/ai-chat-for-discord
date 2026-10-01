@@ -4,27 +4,10 @@ use discord_discussion_bot::{
     agent::{Answer, Source},
     db::{Database, NewRun, RoleChange},
 };
-use sqlx::{ConnectOptions, Row, mysql::MySqlConnectOptions};
+use sqlx::Row;
 
-async fn database() -> Database {
-    let url = std::env::var("TEST_DATABASE_URL")
-        .expect("set TEST_DATABASE_URL to the disposable discussion_test database");
-    let options: MySqlConnectOptions = url.parse().unwrap();
-    assert_eq!(
-        options.get_database(),
-        Some("discussion_test"),
-        "never use a production database for these tests"
-    );
-    // Same pool settings as the bot (session isolation included), smaller.
-    let pool = Database::pool_options()
-        .max_connections(3)
-        .connect_with(options.disable_statement_logging())
-        .await
-        .unwrap();
-    let db = Database { pool };
-    db.migrate().await.unwrap();
-    db
-}
+mod common;
+use common::database;
 
 #[tokio::test]
 #[ignore = "requires compose.test.yaml and TEST_DATABASE_URL"]
@@ -261,5 +244,81 @@ async fn access_and_guilds() {
             use_roles: vec![guild],
             manage_roles: vec![],
         }
+    );
+}
+
+/// Holds the guild's row lock in a transaction of its own, as another save of the same guild
+/// does, until the returned transaction ends.
+async fn hold_guild(db: &Database, guild: u64) -> sqlx::Transaction<'static, sqlx::MySql> {
+    let mut tx = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT guild_id FROM guilds WHERE guild_id=? FOR UPDATE")
+        .bind(guild)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx
+}
+
+async fn insert_role(tx: &mut sqlx::Transaction<'static, sqlx::MySql>, guild: u64, role: u64) {
+    sqlx::query(
+        "INSERT INTO guild_roles (guild_id,kind,role_id,created_at) VALUES (?,'use',?,UTC_TIMESTAMP(3))",
+    )
+    .bind(guild)
+    .bind(role)
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires compose.test.yaml and TEST_DATABASE_URL"]
+async fn guild_role_writes_are_serialized() {
+    let db = database().await;
+    let guild = 940_101_u64;
+    for table in ["guild_roles", "guilds"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE guild_id=?"))
+            .bind(guild)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    db.allow_guild(guild, None).await.unwrap();
+    let pause = std::time::Duration::from_millis(300);
+
+    // A replace into a guild without roles waits for a concurrent save, then replaces what
+    // that save stored instead of merging with it (READ COMMITTED takes no gap locks).
+    let mut other = hold_guild(&db, guild).await;
+    let replace = tokio::spawn({
+        let db = db.clone();
+        async move { db.replace_guild_roles(guild, &[940_202], &[], 1).await }
+    });
+    tokio::time::sleep(pause).await;
+    assert!(
+        !replace.is_finished(),
+        "the replace must wait for the other save"
+    );
+    insert_role(&mut other, guild, 940_201).await;
+    other.commit().await.unwrap();
+    replace.await.unwrap().unwrap();
+    assert_eq!(db.guild_access(guild).await.unwrap().use_roles, [940_202]);
+
+    // An add at the limit waits too, so two adds cannot both pass the count check.
+    let roles: Vec<u64> = (1..MAX_ROLES_PER_KIND as u64)
+        .map(|i| 940_300 + i)
+        .collect();
+    db.replace_guild_roles(guild, &roles, &[], 1).await.unwrap();
+    let mut other = hold_guild(&db, guild).await;
+    let add = tokio::spawn({
+        let db = db.clone();
+        async move { db.add_guild_role(guild, RoleKind::Use, 940_401, None).await }
+    });
+    tokio::time::sleep(pause).await;
+    assert!(!add.is_finished(), "the add must wait for the other save");
+    insert_role(&mut other, guild, 940_400).await;
+    other.commit().await.unwrap();
+    assert_eq!(add.await.unwrap().unwrap(), RoleChange::LimitReached);
+    assert_eq!(
+        db.guild_access(guild).await.unwrap().use_roles.len(),
+        MAX_ROLES_PER_KIND
     );
 }

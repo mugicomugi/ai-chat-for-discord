@@ -194,7 +194,10 @@ docker compose -f compose.test.yaml -p discussion-bot-test restart db-test
 docker compose -f compose.test.yaml -p discussion-bot-test up -d --wait
 cargo test --locked --test database persistence_after_restart -- --ignored --exact
 cargo test --locked --test database access_and_guilds -- --ignored --exact
+cargo test --locked --test database guild_role_writes_are_serialized -- --ignored --exact
 cargo test --locked --test web web_sessions -- --ignored --exact
+cargo test --locked --test web concurrent_logins_of_one_user_all_succeed -- --ignored --exact
+cargo test --locked --test web healthz_reports_database_and_gateway -- --ignored --exact
 cargo test --locked --test web web_login_keeps_only_allowlisted_guilds -- --ignored --exact
 cargo test --locked --test web web_role_settings -- --ignored --exact
 Remove-Item Env:TEST_DATABASE_URL
