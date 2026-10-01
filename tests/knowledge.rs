@@ -103,6 +103,31 @@ fn pdf(pages: &[&str]) -> Vec<u8> {
     out
 }
 
+/// Real Japanese PDFs: one printed from Chromium (embedded font with a ToUnicode map, like
+/// most PDFs from browsers and word processors) and one with a non-embedded CID font and the
+/// predefined UniJIS-UCS2-H CMap (made with reportlab), which the parser cannot decode.
+#[cfg(feature = "pdf")]
+#[tokio::test]
+async fn japanese_pdfs_are_extracted_or_explained() {
+    use extract::MediaType;
+    let embedded = std::fs::read("tests/fixtures/ja-embedded.pdf").unwrap();
+    let text = extract::extract(MediaType::Pdf, &embedded, Some(bot()))
+        .await
+        .unwrap();
+    for expected in [
+        "サーバー運営ガイドライン",
+        "投票は72時間以内に締め切ります。",
+        "（「」『』）",
+    ] {
+        assert!(text.contains(expected), "{expected}: {text:?}");
+    }
+    let cid = std::fs::read("tests/fixtures/ja-cid-nonembedded.pdf").unwrap();
+    assert_eq!(
+        extract::extract(MediaType::Pdf, &cid, Some(bot())).await,
+        Err(ExtractError::PdfFontUnsupported)
+    );
+}
+
 #[cfg(feature = "pdf")]
 #[tokio::test]
 async fn pdf_text_is_extracted_in_a_child_process() {

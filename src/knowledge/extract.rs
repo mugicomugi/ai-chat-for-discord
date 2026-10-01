@@ -31,6 +31,7 @@ const EXIT_ENCRYPTED: i32 = 11;
 const EXIT_TOO_MANY_PAGES: i32 = 12;
 const EXIT_TOO_LONG: i32 = 13;
 const EXIT_UNAVAILABLE: i32 = 14;
+const EXIT_FONT_UNSUPPORTED: i32 = 15;
 
 /// One PDF at a time: the parser's memory counts against the bot's container limit.
 static PDF_SLOT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
@@ -104,6 +105,9 @@ pub enum ExtractError {
     PdfTooComplex,
     #[error("pdf_timeout")]
     PdfTimeout,
+    /// A font the parser cannot decode, typically a non-embedded Japanese CID font.
+    #[error("pdf_font_unsupported")]
+    PdfFontUnsupported,
     /// Another PDF is being read.
     #[error("pdf_busy")]
     PdfBusy,
@@ -127,6 +131,7 @@ impl ExtractError {
             Self::PdfTooManyPages => "pdf_too_many_pages",
             Self::PdfTooLarge => "pdf_too_large",
             Self::PdfTooComplex => "pdf_too_complex",
+            Self::PdfFontUnsupported => "pdf_font_unsupported",
             Self::PdfTimeout => "pdf_timeout",
             Self::PdfBusy => "pdf_busy",
             Self::PdfUnavailable => "pdf_unavailable",
@@ -165,6 +170,7 @@ impl ExtractError {
                 MAX_PDF_BYTES / (1024 * 1024)
             ),
             Self::PdfTooComplex => "PDF の読み取り中にメモリが足りなくなりました。ページ数を減らすか、ファイルを分割してください。".into(),
+            Self::PdfFontUnsupported => "この PDF は埋め込まれていないフォント（古い日本語 PDF に多い CID フォント）を使っているため、文字を取り出せません。ブラウザやワープロで開いて PDF として保存し直すか、テキストファイルにして登録してください。".into(),
             Self::PdfTimeout => {
                 "PDF の読み取りに時間がかかりすぎたため中止しました。ファイルを分割してください。"
                     .into()
@@ -347,6 +353,7 @@ async fn extract_pdf(bytes: &[u8], program: Option<PathBuf>) -> Result<String, E
         Some(EXIT_TOO_LONG) => Err(ExtractError::TooLong),
         Some(EXIT_UNAVAILABLE) => Err(ExtractError::PdfUnavailable),
         Some(EXIT_INVALID) => Err(ExtractError::PdfInvalid),
+        Some(EXIT_FONT_UNSUPPORTED) => Err(ExtractError::PdfFontUnsupported),
         code => {
             // A panic in the parser (101), or a kill: the child asks the kernel to pick it first
             // when the container runs out of memory.
@@ -427,7 +434,24 @@ fn pdf_text(input: &[u8]) -> Result<String, i32> {
         return Err(EXIT_TOO_MANY_PAGES);
     }
     let mut text = String::new();
-    let result = output_doc(&document, &mut PlainTextOutput::new(Capped(&mut text)));
+    // pdf-extract panics on fonts it cannot decode, such as non-embedded Japanese CID fonts with
+    // a predefined CMap (UniJIS-UCS2-H and the like). Catch that so the user is told why.
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        output_doc(&document, &mut PlainTextOutput::new(Capped(&mut text)))
+    }))
+    .map_err(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if message.contains("unsupported encoding") {
+            EXIT_FONT_UNSUPPORTED
+        } else {
+            EXIT_INVALID
+        }
+    })?;
     match result {
         Ok(()) => Ok(text),
         Err(pdf_extract::OutputError::FormatError(_)) => Err(EXIT_TOO_LONG),
@@ -573,6 +597,7 @@ mod tests {
             ExtractError::PdfTooManyPages,
             ExtractError::PdfTooLarge,
             ExtractError::PdfTooComplex,
+            ExtractError::PdfFontUnsupported,
             ExtractError::PdfTimeout,
             ExtractError::PdfBusy,
             ExtractError::PdfUnavailable,
