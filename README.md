@@ -10,17 +10,36 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 /talk message:この議論の論点を整理して
 /talk message:最新情報も調べて比較して web_search:true history:2h
 /talk message:この設計を評価して history:0m
+/talk message:今週の議論をまとめて history:7d
 ```
 
 | オプション | デフォルト | 内容 |
 | --- | --- | --- |
 | `message` | 必須 | 質問本文。1〜4000文字 |
 | `web_search` | `false` | `true` の呼び出しだけWeb検索・ページ取得を許可 |
-| `history` | `15m` | `30m`、`2h` など整数の分・時間。最大24時間。`0m` / `0h` で履歴なし |
+| `history` | `15m` | `30m`、`2h`、`3d` など整数の分・時間・日。最大7日（`7d` / `168h` / `10080m`）で、その中の直近100件まで。`0m` / `0h` / `0d` で履歴なし |
 
 オプションは毎回独立しています。前の呼び出しの設定は引き継ぎません。通常のテキストチャンネル・既存スレッド・フォーラム投稿内で利用できます。回答は公開されます。DM、画像・添付ファイル解析、メンションによる呼び出しは実装していません。
 
-**利用制御:** Bot自体はロールによる利用制限を行いません。誰が `/talk` を使えるかは、サーバーごとにDiscordのサーバー設定内の連携サービス（Integrations）のコマンド権限で制御してください。設定はサーバー単位で完結し、Bot側の再起動や設定変更は不要です。未設定の場合、既定でそのサーバーの全員が利用できます。利用を制限した相手が呼び出すと、Discordが「アプリケーションの応答がありません」（クライアント言語等によって表記が異なる場合あり）を表示します。サーバーの通常投稿は、発言者に関わらず履歴の参照対象です。
+**利用制御:** 次の2つを両方満たす人だけが `/talk` を使えます。サーバーの管理者も例外ではありません。
+
+1. そのサーバーが運営者の許可リストに入っている（`ops guild allow`、[docs/runbook.md](docs/runbook.md) の「サーバーを追加する」）。
+2. そのサーバーで「利用ロール」に設定されたロールを持っている。**利用ロールが未設定のサーバーでは誰も使えません。** 全員に許可する場合は `@everyone` を利用ロールにします。
+
+利用ロールは、各サーバーで「サーバー管理」権限を持つ人が `/config` で設定します（応答は本人にだけ表示されます）。
+
+```text
+/config role-add role:@メンバー
+/config role-add role:@運営 type:ナレッジ管理
+/config role-remove role:@メンバー
+/config show
+```
+
+- 「ナレッジ管理」ロールは、今後追加するナレッジベースの資料を管理できるロールです（[docs/roadmap.md](docs/roadmap.md)）。ロールの設定を変更できるのは、サーバーのオーナーと「管理者」「サーバー管理」権限を持つ人だけです。
+- Discordで削除したロールは、設定からも自動で外れます。
+- 利用できない人が `/talk` を実行すると、理由が本人にだけ表示されます。履歴の取得・DBへの保存・AIの呼び出しは行いません。
+- Discordのサーバー設定の連携サービス（Integrations）でコマンド権限を設定すると、`/talk` を表示する相手をさらに絞れます。
+- サーバーの通常投稿は、発言者が利用ロールを持つかどうかに関わらず履歴の参照対象です。
 
 ## セットアップ
 
@@ -30,7 +49,7 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 2. **Bot → Privileged Gateway Intents → Message Content Intent** を有効にします。Server Members Intentは不要です。大規模な導入でIntentの審査が必要になった場合はDiscordの案内に従ってください。
 3. **Installation / OAuth2 URL Generator** でサーバーへのインストールを選び、`bot` と `applications.commands` のスコープを設定します。本番では Install Link を None にして **Public Bot を OFF** にし、運営者が許可したサーバーにだけ追加します（手順は [docs/runbook.md](docs/runbook.md) の「サーバーを追加する」）。
 4. Botに `View Channels`、`Read Message History`、`Send Messages`、`Send Messages in Threads` の権限を付けて招待します。Administratorは不要です。プライベートスレッドではBotもメンバーとして参加させます。
-5. 利用者を制限したいサーバーでは、サーバー設定の連携サービス（Integrations）で `/talk` を使えるロール・ユーザーを設定します。サーバーごとに独立した設定です。
+5. 運営者がサーバーを許可リストに追加し（`ops guild allow`）、そのサーバーの管理者が `/config role-add` で利用ロールを設定します。
 
 履歴参照時はBotと実行者の両方に閲覧・履歴閲覧権限が必要です。Botが読めないチャンネルへ権限を拡大する動作はありません。
 
@@ -57,7 +76,7 @@ MARIADB_ROOT_PASSWORD=your_different_long_random_root_password
 
 - `BOT_IMAGE` は起動するイメージです。本番では `scripts/build-image.sh` が表示するタグ（`discord-discussion-bot:git-<コミット>`）を `scripts/deploy.sh` に渡すと書き換わります。手元でビルドする場合は `discord-discussion-bot:local` など任意の名前にします。
 - Ollamaキーは [Ollamaの設定](https://ollama.com/settings/keys) で発行します。推論と検索で同じキーを使用します。
-- `/talk` はグローバルコマンドとして登録され、Botをインストールした全サーバーで利用できます。登録直後は反映まで最大1時間ほどかかる場合があります。会話履歴・DBの記録はサーバー（ギルド）ごとに分離されます。
+- `/talk` と `/config` はグローバルコマンドとして登録され、Botをインストールした全サーバーに表示されます（使えるのは許可リストに入ったサーバーだけです）。登録直後は反映まで最大1時間ほどかかる場合があります。会話履歴・DBの記録はサーバー（ギルド）ごとに分離されます。
 - `RETENTION_DAYS=30`：DBの保持期間（1〜3650日）。起動時と1時間ごとに期限切れを削除します。
 - `REQUEST_TIMEOUT_SECONDS=180`：履歴取得から回答投稿までのタイムアウト（10〜600秒）。個々のOllama HTTPリクエストは最大120秒です。
 - `RUST_LOG=discord_discussion_bot=info`：通常ログ。本文・キー・DBパスワード・内部推論は記録しません。依存ライブラリの詳細ログを有効にする場合は、そこに含まれるデータに注意してください。
@@ -91,7 +110,7 @@ docker compose up -d
 - 参照期間は `/talk` の呼び出し日時を基準とし、開始時刻を含み、呼び出し時刻以降の投稿は含みません。スレッドと親チャンネルは独立しています。
 - 通常投稿は必要時にDiscordから取得し、常時収集・DB保存はしません。対象は人間のテキスト投稿と本Botの回答です。他Botと外部Webhookは除外します。
 - 過去の `/talk` の質問はMariaDBから取得します。Bot回答はDiscordに現存するメッセージを使うため、再起動しても参照できます。削除されたBot回答をDBから復活させることはありません。質問はDBの保持期間中は残ります。
-- 時系列に整列し、ID重複を除き、最新500件・本文合計60,000 Unicode文字までAIに渡します。Discord取得は1回100件、最大10ページです。混雑したチャンネルなどで上限に達したら省略を明示します。発言者と日時も渡します。
+- 時系列に整列し、ID重複を除き、最新100件・本文合計60,000 Unicode文字までAIに渡します。Discord取得は1回100件、最大10ページです。混雑したチャンネルなどで上限に達したら省略を明示します。発言者と日時も渡します。
 - `history:0m` は通常投稿・過去の質問の両方を参照しません。現在の質問・回答は保存します。
 - `web_search:false` ではツール定義をモデルに渡さず、モデルがツール呼び出しを返しても実行しません。
 - `web_search:true` ではAIが必要に応じてOllamaの検索・ページ取得APIを呼びます。最大5ツール実行、検索1回5件、検索本文1件4000文字・取得ページ8000文字を上限とします。取得した出典URL一覧を回答末尾に付けます。検索が不要と判断された場合は実行しません。
@@ -127,6 +146,7 @@ cargo test --locked --test database database_lifecycle -- --ignored --exact
 docker compose -f compose.test.yaml -p discussion-bot-test restart db-test
 docker compose -f compose.test.yaml -p discussion-bot-test up -d --wait
 cargo test --locked --test database persistence_after_restart -- --ignored --exact
+cargo test --locked --test database access_and_guilds -- --ignored --exact
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
@@ -146,13 +166,14 @@ cargo test --locked --test live_ollama -- --ignored
 
 ### 実サービスの確認
 
-実トークンと利用ロールの設定後、以下をテストサーバーで確認します。
+実トークンを設定し、テストサーバーを許可リストに入れてから、以下を確認します。
 
-1. 既定の `/talk` が応答する。サーバー設定の連携サービスで利用を制限したユーザーは無応答エラーとなり、DBにレコードが増えない。
-2. 過去15分内の通常投稿が反映され、`history:2h` では範囲が広がり、`history:0m` では参照されない。
-3. `web_search:true` で検索を明示的に依頼すると出典付きで回答する。省略時・`false` では検索しない。
-4. 別チャンネル・親チャンネルの会話がスレッド内の文脈へ混入しない。
-5. 同じチャンネルでの連続呼び出し、長文、権限不足、再起動後の会話継続を確認する。
+1. 許可リストにないサーバー、利用ロールを持たないユーザー（管理者を含む）では、`/talk` が理由を本人にだけ表示して終わり、DBにレコードが増えない。
+2. `/config role-add` で利用ロールを付けると `/talk` が応答し、`/config role-remove` で外すと再び使えなくなる。「サーバー管理」権限のないユーザーは `/config` を変更できない。
+3. 過去15分内の通常投稿が反映され、`history:2h` や `history:3d` では範囲が広がり、`history:0m` では参照されない。`history:8d` は入力エラーになる。
+4. `web_search:true` で検索を明示的に依頼すると出典付きで回答する。省略時・`false` では検索しない。
+5. 別チャンネル・親チャンネルの会話がスレッド内の文脈へ混入しない。
+6. 同じチャンネルでの連続呼び出し、長文、権限不足、再起動後の会話継続を確認する。
 
 ## 更新・バックアップ
 

@@ -3,11 +3,16 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-pub const MAX_MESSAGES: usize = 500;
+/// The newest entries kept for the model; older ones in the window are dropped and reported.
+pub const MAX_MESSAGES: usize = 100;
 pub const MAX_CHARS: usize = 60_000;
+/// Longest window `history` accepts: 7 days.
+pub const MAX_SECONDS: u32 = 7 * 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("history は 0m〜1440m または 0h〜24h の整数で指定してください（例: 15m、2h）。")]
+#[error(
+    "history は 0m〜10080m、0h〜168h、0d〜7d のいずれかの整数で指定してください（例: 15m、2h、3d）。"
+)]
 pub struct InvalidHistory;
 
 pub fn parse_history(value: Option<&str>) -> Result<u32, InvalidHistory> {
@@ -16,6 +21,8 @@ pub fn parse_history(value: Option<&str>) -> Result<u32, InvalidHistory> {
         (v, 60)
     } else if let Some(v) = value.strip_suffix('h') {
         (v, 3600)
+    } else if let Some(v) = value.strip_suffix('d') {
+        (v, 86_400)
     } else {
         return Err(InvalidHistory);
     };
@@ -26,7 +33,7 @@ pub fn parse_history(value: Option<&str>) -> Result<u32, InvalidHistory> {
         .parse::<u32>()
         .ok()
         .and_then(|v| v.checked_mul(multiplier))
-        .filter(|v| *v <= 86_400)
+        .filter(|v| *v <= MAX_SECONDS)
         .ok_or(InvalidHistory)
 }
 
@@ -93,6 +100,12 @@ mod tests {
             (Some("30m"), 1800),
             (Some("2h"), 7200),
             (Some("24h"), 86400),
+            (Some("25h"), 90000),
+            (Some("2d"), 172_800),
+            (Some("0d"), 0),
+            (Some("7d"), 604_800),
+            (Some("168h"), 604_800),
+            (Some("10080m"), 604_800),
         ] {
             assert_eq!(parse_history(input).unwrap(), expected);
         }
@@ -101,12 +114,15 @@ mod tests {
             "15",
             "-1m",
             "1.5h",
-            "25h",
-            "1441m",
+            "8d",
+            "169h",
+            "10081m",
             "999999999999h",
+            "99999999999d",
             "+1m",
             " 2h",
-            "2d",
+            "d",
+            "2w",
         ] {
             assert!(parse_history(Some(invalid)).is_err(), "{invalid}");
         }
@@ -142,7 +158,7 @@ mod tests {
     fn newest_count_and_unicode_budget() {
         let end = Utc::now();
         let at = end - Duration::seconds(1);
-        let items = (0..501)
+        let items = (0..=MAX_MESSAGES as u64)
             .map(|id| Entry {
                 id,
                 at,
@@ -151,7 +167,7 @@ mod tests {
             })
             .collect();
         let result = merge(items, at, end, false);
-        assert_eq!(result.entries.len(), 500);
+        assert_eq!(result.entries.len(), MAX_MESSAGES);
         assert_eq!(result.entries[0].id, 1);
         assert!(result.truncated);
         let result = merge(

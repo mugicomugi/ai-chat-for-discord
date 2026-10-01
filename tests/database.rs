@@ -1,7 +1,8 @@
 use chrono::{Duration, Utc};
 use discord_discussion_bot::{
+    access::{GuildAccess, MAX_ROLES_PER_KIND, RoleKind},
     agent::{Answer, Source},
-    db::{Database, NewRun},
+    db::{Database, NewRun, RoleChange},
 };
 use sqlx::{ConnectOptions, Row, mysql::MySqlConnectOptions};
 
@@ -144,4 +145,121 @@ async fn persistence_after_restart() {
             .await
             .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires compose.test.yaml and TEST_DATABASE_URL"]
+async fn access_and_guilds() {
+    let db = database().await;
+    // Guild IDs used only by this test, so it can run in any order with the others.
+    let (guild, other) = (900_001_u64, 900_002_u64);
+    for table in ["guild_roles", "guilds"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE guild_id IN (?,?)"))
+            .bind(guild)
+            .bind(other)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db.guild_access(guild).await.unwrap(),
+        GuildAccess::default()
+    );
+
+    // Roles set before the guild is allowed grant nothing yet.
+    assert_eq!(
+        db.add_guild_role(guild, RoleKind::Use, 11, Some(99))
+            .await
+            .unwrap(),
+        RoleChange::Added
+    );
+    assert!(!db.guild_access(guild).await.unwrap().allowed);
+
+    db.allow_guild(guild, Some("テスト用")).await.unwrap();
+    db.allow_guild(other, None).await.unwrap();
+    let settings = db.guild_access(guild).await.unwrap();
+    assert!(settings.allowed);
+    assert_eq!(settings.use_roles, [11]);
+    assert!(settings.manage_roles.is_empty());
+
+    assert_eq!(
+        db.add_guild_role(guild, RoleKind::Use, 11, None)
+            .await
+            .unwrap(),
+        RoleChange::AlreadyPresent
+    );
+    // The same role may hold both kinds; @everyone is the guild's own ID.
+    for (kind, role) in [
+        (RoleKind::Manage, 11),
+        (RoleKind::Use, guild),
+        (RoleKind::Use, 12),
+    ] {
+        assert_eq!(
+            db.add_guild_role(guild, kind, role, None).await.unwrap(),
+            RoleChange::Added
+        );
+    }
+    let settings = db.guild_access(guild).await.unwrap();
+    assert_eq!(settings.use_roles, [11, guild, 12]);
+    assert_eq!(settings.manage_roles, [11]);
+    assert!(db.guild_access(other).await.unwrap().use_roles.is_empty());
+
+    for role in 0..MAX_ROLES_PER_KIND as u64 {
+        db.add_guild_role(other, RoleKind::Manage, 1000 + role, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db.add_guild_role(other, RoleKind::Manage, 5000, None)
+            .await
+            .unwrap(),
+        RoleChange::LimitReached
+    );
+
+    assert!(
+        db.remove_guild_role(guild, RoleKind::Use, 12)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.remove_guild_role(guild, RoleKind::Use, 12)
+            .await
+            .unwrap()
+    );
+    // A role deleted in Discord disappears from every kind.
+    assert_eq!(db.forget_role(guild, 11).await.unwrap(), 2);
+    assert_eq!(db.guild_access(guild).await.unwrap().use_roles, [guild]);
+
+    assert!(db.deny_guild(guild).await.unwrap());
+    assert!(!db.deny_guild(guild).await.unwrap());
+    assert!(!db.guild_access(guild).await.unwrap().allowed);
+    let row = db
+        .guilds()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.guild_id == guild)
+        .unwrap();
+    assert!(!row.allowed() && row.denied_at.is_some() && row.left_at.is_none());
+    assert_eq!(row.note.as_deref(), Some("テスト用"));
+
+    // Allowing again lifts the denial and keeps the note when none is given.
+    db.allow_guild(guild, None).await.unwrap();
+    let row = db
+        .guilds()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.guild_id == guild)
+        .unwrap();
+    assert!(row.allowed());
+    assert_eq!(row.note.as_deref(), Some("テスト用"));
+    assert_eq!(
+        db.guild_access(guild).await.unwrap(),
+        GuildAccess {
+            allowed: true,
+            use_roles: vec![guild],
+            manage_roles: vec![],
+        }
+    );
 }

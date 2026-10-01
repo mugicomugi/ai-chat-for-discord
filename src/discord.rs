@@ -10,9 +10,10 @@ use chrono::{DateTime, Duration, Utc};
 use serenity::{all::*, async_trait};
 
 use crate::{
+    access::{self, Access, GuildAccess, MAX_ROLES_PER_KIND, RoleKind, role_mention},
     agent::{Agent, AgentError},
     config::Config,
-    db::{Database, NewRun},
+    db::{Database, NewRun, RoleChange},
     history::{self, Entry, History},
     limits::{Busy, Limits},
     output::split_message,
@@ -91,10 +92,56 @@ pub fn talk_command() -> CreateCommand {
             CreateCommandOption::new(
                 CommandOptionType::String,
                 "history",
-                "参照期間: 15m、2hなど。省略時15m、0mで履歴なし、最大24h",
+                "参照期間: 15m、2h、3dなど。省略時15m、0mで履歴なし、最大7d（直近100件）",
             )
             .max_length(8),
         )
+}
+
+const GUILD_NOT_ALLOWED: &str = "このサーバーでは、このBotの利用が許可されていません。";
+const NO_USE_ROLE: &str = "このBotを使うには、サーバー管理者が許可したロールが必要です。管理者は /config role-add で設定できます。";
+const ACCESS_CHECK_FAILED: &str =
+    "利用権限を確認できませんでした。時間をおいて再試行してください。";
+const SETTINGS_SAVE_FAILED: &str = "設定を保存できませんでした。時間をおいて再試行してください。";
+
+pub fn config_command() -> CreateCommand {
+    let role = |description: &str| {
+        CreateCommandOption::new(CommandOptionType::Role, "role", description).required(true)
+    };
+    let kind = || {
+        CreateCommandOption::new(CommandOptionType::String, "type", "種類（省略時: 利用）")
+            .add_string_choice("利用（/talk・Webチャット）", RoleKind::Use.as_str())
+            .add_string_choice("ナレッジ管理", RoleKind::Manage.as_str())
+    };
+    CreateCommand::new("config")
+        .description("このサーバーでのBotの利用設定（サーバー管理権限が必要）")
+        // Only a default for the command picker; the handler re-checks MANAGE_GUILD itself.
+        .default_member_permissions(Permissions::MANAGE_GUILD)
+        .contexts(vec![InteractionContext::Guild])
+        .integration_types(vec![InstallationContext::Guild])
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "role-add",
+                "Botを使えるロール、またはナレッジを管理できるロールを追加します",
+            )
+            .add_sub_option(role("追加するロール"))
+            .add_sub_option(kind()),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "role-remove",
+                "設定したロールを外します",
+            )
+            .add_sub_option(role("外すロール"))
+            .add_sub_option(kind()),
+        )
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "show",
+            "現在の設定を表示します",
+        ))
 }
 
 pub fn no_mentions() -> CreateAllowedMentions {
@@ -113,7 +160,8 @@ impl EventHandler for Handler {
         }
         // Bulk-overwrite (rather than single create) so this call alone fully reflects the
         // current definition, even if a prior run registered /talk with different options.
-        let result = Command::set_global_commands(&ctx.http, vec![talk_command()]).await;
+        let result =
+            Command::set_global_commands(&ctx.http, vec![talk_command(), config_command()]).await;
         if let Err(error) = result {
             self.registered.store(false, Ordering::SeqCst);
             match error {
@@ -143,10 +191,29 @@ impl EventHandler for Handler {
         let Interaction::Command(command) = interaction else {
             return;
         };
-        if command.data.name != "talk" {
-            return;
+        match command.data.name.as_str() {
+            "talk" => self.handle(&ctx, &command).await,
+            "config" => self.config(&ctx, &command).await,
+            _ => {}
         }
-        self.handle(&ctx, &command).await;
+    }
+
+    async fn guild_role_delete(
+        &self,
+        _ctx: Context,
+        guild_id: GuildId,
+        removed_role_id: RoleId,
+        _removed_role_data_if_available: Option<Role>,
+    ) {
+        match self
+            .db
+            .forget_role(guild_id.get(), removed_role_id.get())
+            .await
+        {
+            Ok(0) => {}
+            Ok(_) => tracing::info!(guild_id = guild_id.get(), "deleted_role_forgotten"),
+            Err(_) => tracing::warn!(guild_id = guild_id.get(), "deleted_role_cleanup_failed"),
+        }
     }
 }
 
@@ -156,6 +223,21 @@ impl Handler {
             reject(ctx, command, "このコマンドはサーバー内で利用してください。").await;
             return;
         };
+        // Unauthorized calls get an explanation but never touch history, the database or the AI.
+        let Some((settings, access)) = self.access(command, guild).await else {
+            reject(ctx, command, ACCESS_CHECK_FAILED).await;
+            return;
+        };
+        if !access.use_bot {
+            let (reason, message) = if settings.allowed {
+                ("no_use_role", NO_USE_ROLE)
+            } else {
+                ("guild_not_allowed", GUILD_NOT_ALLOWED)
+            };
+            tracing::info!(guild_id = guild.get(), reason, "talk_rejected");
+            reject(ctx, command, message).await;
+            return;
+        }
         let mut question = None;
         let mut web_search = false;
         let mut history_value = None;
@@ -376,6 +458,123 @@ impl Handler {
         }
     }
 
+    /// The guild's settings and the caller's rights. Bounded to stay inside Discord's 3-second
+    /// window for the first response; `None` if the database did not answer in time.
+    async fn access(
+        &self,
+        command: &CommandInteraction,
+        guild: GuildId,
+    ) -> Option<(GuildAccess, Access)> {
+        let settings = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.db.guild_access(guild.get()),
+        )
+        .await
+        {
+            Ok(Ok(settings)) => settings,
+            _ => {
+                tracing::warn!(guild_id = guild.get(), "guild_access_lookup_failed");
+                return None;
+            }
+        };
+        let member = command.member.as_deref();
+        let roles: Vec<u64> = member
+            .map(|member| member.roles.iter().map(|role| role.get()).collect())
+            .unwrap_or_default();
+        let access = access::decide(
+            &settings,
+            &access::Member {
+                guild_id: guild.get(),
+                roles: &roles,
+                permissions: member
+                    .and_then(|member| member.permissions)
+                    .unwrap_or_else(Permissions::empty),
+                // Discord already resolves the owner's interaction permissions to all permissions.
+                is_owner: false,
+            },
+        );
+        Some((settings, access))
+    }
+
+    async fn config(&self, ctx: &Context, command: &CommandInteraction) {
+        let Some(guild) = command.guild_id else {
+            reject(ctx, command, "このコマンドはサーバー内で利用してください。").await;
+            return;
+        };
+        let Some((settings, access)) = self.access(command, guild).await else {
+            reject(ctx, command, ACCESS_CHECK_FAILED).await;
+            return;
+        };
+        if !settings.allowed {
+            reject(ctx, command, GUILD_NOT_ALLOWED).await;
+            return;
+        }
+        if !access.configure {
+            reject(
+                ctx,
+                command,
+                "この設定を変更するには「サーバー管理」権限が必要です。",
+            )
+            .await;
+            return;
+        }
+        let Some(subcommand) = command.data.options.first() else {
+            return;
+        };
+        let CommandDataOptionValue::SubCommand(options) = &subcommand.value else {
+            return;
+        };
+        let mut role = None;
+        let mut kind = RoleKind::Use;
+        for option in options {
+            match (option.name.as_str(), &option.value) {
+                ("role", CommandDataOptionValue::Role(id)) => role = Some(id.get()),
+                ("type", CommandDataOptionValue::String(value)) => {
+                    kind = RoleKind::parse(value).unwrap_or(RoleKind::Use)
+                }
+                _ => {}
+            }
+        }
+        let guild_id = guild.get();
+        let message = match (subcommand.name.as_str(), role) {
+            ("role-add", Some(role)) => {
+                let mention = role_mention(guild_id, role);
+                match self
+                    .db
+                    .add_guild_role(guild_id, kind, role, Some(command.user.id.get()))
+                    .await
+                {
+                    Ok(RoleChange::Added) => {
+                        tracing::info!(guild_id, kind = kind.as_str(), "guild_role_added");
+                        format!("{mention} を「{}」ロールに追加しました。", kind.label())
+                    }
+                    Ok(RoleChange::AlreadyPresent) => {
+                        format!("{mention} はすでに「{}」ロールです。", kind.label())
+                    }
+                    Ok(RoleChange::LimitReached) => format!(
+                        "「{}」ロールは{MAX_ROLES_PER_KIND}個まで設定できます。",
+                        kind.label()
+                    ),
+                    Err(_) => SETTINGS_SAVE_FAILED.to_owned(),
+                }
+            }
+            ("role-remove", Some(role)) => {
+                let mention = role_mention(guild_id, role);
+                match self.db.remove_guild_role(guild_id, kind, role).await {
+                    Ok(true) => {
+                        tracing::info!(guild_id, kind = kind.as_str(), "guild_role_removed");
+                        format!("{mention} を「{}」ロールから外しました。", kind.label())
+                    }
+                    Ok(false) => format!("{mention} は「{}」ロールではありません。", kind.label()),
+                    Err(_) => SETTINGS_SAVE_FAILED.to_owned(),
+                }
+            }
+            ("show", _) => describe_settings(guild_id, &settings),
+            _ => return,
+        };
+        reject(ctx, command, &message).await;
+    }
+
     async fn load_history(
         &self,
         ctx: &Context,
@@ -393,7 +592,7 @@ impl Handler {
         let mut entries = Vec::new();
         let mut before = MessageId::new(command.id.get());
         let mut truncated = false;
-        // Bounded pagination: up to 1000 raw messages, then keep the latest 500 relevant entries.
+        // Bounded pagination: up to 1000 raw messages, then keep the newest MAX_MESSAGES entries.
         for page in 0..10 {
             let messages = command
                 .channel_id
@@ -464,6 +663,35 @@ fn timestamp(value: Timestamp) -> DateTime<Utc> {
         .expect("Discord timestamp is representable")
 }
 
+fn describe_settings(guild_id: u64, settings: &GuildAccess) -> String {
+    let list = |roles: &[u64], empty: &str| {
+        if roles.is_empty() {
+            empty.to_owned()
+        } else {
+            roles
+                .iter()
+                .map(|role| role_mention(guild_id, *role))
+                .collect::<Vec<_>>()
+                .join("、")
+        }
+    };
+    format!(
+        "**このサーバーの設定**\n\
+         利用ロール（/talk）: {}\n\
+         ナレッジ管理ロール: {}\n\n\
+         追加は /config role-add、削除は /config role-remove で行います。削除済みのロールは @deleted-role と表示されます。",
+        list(
+            settings.roles(RoleKind::Use),
+            "未設定（現在は誰も /talk を使えません）"
+        ),
+        list(
+            settings.roles(RoleKind::Manage),
+            "未設定（サーバー管理権限を持つ人だけが管理できます）"
+        ),
+    )
+}
+
+/// Replies only to the caller (rejections and settings), with mentions disabled.
 async fn reject(ctx: &Context, command: &CommandInteraction, message: &str) {
     let _ = command
         .create_response(
@@ -491,6 +719,26 @@ mod tests {
         assert_eq!(value["integration_types"], serde_json::json!([0]));
         assert!(value.get("dm_permission").is_none());
         assert_eq!(value["options"][0]["required"], true);
+        let config = serde_json::to_value(config_command()).unwrap();
+        assert_eq!(config["name"], "config");
+        // MANAGE_GUILD (1 << 5), serialized as a string.
+        assert_eq!(config["default_member_permissions"], "32");
+        assert_eq!(config["contexts"], serde_json::json!([0]));
+        let subcommands: Vec<_> = config["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(subcommands, ["role-add", "role-remove", "show"]);
+        assert_eq!(config["options"][0]["options"][0]["required"], true);
+        let choices: Vec<_> = config["options"][0]["options"][1]["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|choice| choice["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(choices, ["use", "manage"]);
         let mentions = serde_json::to_value(no_mentions()).unwrap();
         assert_eq!(mentions["parse"], serde_json::json!([]));
         assert_eq!(mentions["replied_user"], false);

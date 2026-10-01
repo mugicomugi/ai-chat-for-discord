@@ -122,6 +122,8 @@
 
 4. **切り戻し**: `sudo tail backups/deploy-history.log` の `previous=` の値を指定して、同じコマンドを実行します。マイグレーションは追加だけなので、古いイメージも新しいスキーマで起動できます。直近 3 つのイメージを残しています。
 
+   > **M1 より前のイメージに戻すと、サーバーの許可リストとロールによる利用制限が効かなくなります。** Bot を追加しているサーバーの全員が `/talk` を使える状態に戻ります。DB の設定は残るので、M1 以降のイメージに戻せば再び有効になります。
+
 **M0 以前のイメージ（`docker compose up --build` でビルドしていた頃のもの）に戻す場合**は、`deploy.sh` が受け付けないタグなので、次のように戻します。
 
 ```bash
@@ -283,8 +285,43 @@ Public Bot が OFF のときは、アプリの所有者しか Bot を追加で�
    https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot%20applications.commands&permissions=274877975552&guild_id=<GUILD_ID>&disable_guild_select=true&integration_type=0
    ```
 
-3. 許可リストへ追加する（M1 以降: `sudo docker compose exec bot /app/bot ops guild allow <GUILD_ID>`）。
-4. 一時的に付けたロールを外してもらう。
+3. 許可リストへ追加する。
+
+   ```bash
+   sudo docker compose exec bot /app/bot ops guild allow <GUILD_ID> <メモ（任意）>
+   ```
+
+4. 利用ロールを決める。**利用ロールが未設定のサーバーでは誰も `/talk` を使えません。**
+   - 通常は、そのサーバーの「サーバー管理」権限を持つ人に `/config role-add role:<ロール>` を実行してもらう。
+   - 運営者が代わりに設定する場合は `ops guild role add <GUILD_ID> use <ROLE_ID>`（下記）。全員に許可するときは ROLE_ID に GUILD_ID（@everyone）を指定する。
+5. 一時的に付けたロールを外してもらう。
+
+### 許可リストとロールの操作（ops コマンド）
+
+稼働中の Bot コンテナの中で実行します（Bot と同じ DB とトークンを使い、Discord への常時接続はしません）。ロール ID は Discord の開発者モードでロールを右クリックしてコピーします。
+
+```bash
+ops() { sudo docker compose exec bot /app/bot ops "$@"; }
+ops guild list                               # 許可リストと、Bot が参加しているサーバーの一覧
+ops guild allow <GUILD_ID> [メモ]             # 許可する（拒否していた場合は解除）
+ops guild deny <GUILD_ID>                    # 許可を取り消す（ロールの設定は残る）
+ops guild role list <GUILD_ID>               # 設定済みのロール
+ops guild role add <GUILD_ID> use <ROLE_ID>       # 利用ロールを追加
+ops guild role add <GUILD_ID> manage <ROLE_ID>    # ナレッジ管理ロールを追加
+ops guild role remove <GUILD_ID> use <ROLE_ID>    # 外す
+```
+
+- 種類ごとに最大 25 ロールです。Discord で削除したロールは自動で設定から外れます。
+- ロールの設定を変えられるのは、`/config` ではサーバーのオーナーと「管理者」「サーバー管理」権限を持つ人だけです（ナレッジ管理ロールでは変更できません）。
+
+### M1 を初めてデプロイしたとき（一度だけ）
+
+M1 から、許可リストに入っていて利用ロールが設定されたサーバーでしか `/talk` が使えません。**デプロイした直後は、すべてのサーバーで誰も使えなくなる**ので、続けて次を行います。
+
+1. `ops guild list` で、Bot が参加しているサーバーを確認する（STATUS がすべて `not-allowed` になっている）。
+2. 使い続けるサーバーごとに `ops guild allow <GUILD_ID>` を実行する。
+3. 利用ロールを設定する。各サーバーの管理者に `/config role-add` を依頼するか、運営者が `ops guild role add` で設定する。これまでどおり全員に使わせる場合は `ops guild role add <GUILD_ID> use <GUILD_ID>`（@everyone）。
+4. `ops guild role list <GUILD_ID>` で確認し、テスト用のアカウントで `/talk` が応答することを確かめる。
 
 ## 9. 古いギルドコマンドの掃除（一度だけ）
 

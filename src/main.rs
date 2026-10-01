@@ -11,6 +11,7 @@ use discord_discussion_bot::{
     db::{Database, migrate_error_summary},
     discord::Handler,
     limits::Limits,
+    ops,
 };
 use serenity::all::{Client, GatewayIntents};
 use tracing_subscriber::EnvFilter;
@@ -24,6 +25,15 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new("discord_discussion_bot=info")),
         )
         .init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("ops") {
+        // Operator-facing: print the message only, never a backtrace.
+        if let Err(error) = ops::run(&args[1..]).await {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let config = Arc::new(Config::from_env()?);
     let db = Database::connect(&config).await.map_err(|_| {
         anyhow::anyhow!("database connection failed; check MariaDB and environment settings")

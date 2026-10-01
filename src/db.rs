@@ -7,7 +7,12 @@ use sqlx::{
     mysql::{MySqlConnectOptions, MySqlPoolOptions},
 };
 
-use crate::{agent::Answer, config::Config, history::Entry};
+use crate::{
+    access::{GuildAccess, MAX_ROLES_PER_KIND, RoleKind},
+    agent::Answer,
+    config::Config,
+    history::{self, Entry},
+};
 
 #[derive(Clone)]
 pub struct Database {
@@ -24,6 +29,29 @@ pub struct NewRun<'a> {
     pub web_search: bool,
     pub history_seconds: u32,
     pub invoked_at: DateTime<Utc>,
+}
+
+/// One row of the operator's guild allowlist.
+#[derive(Debug, Clone)]
+pub struct GuildRow {
+    pub guild_id: u64,
+    pub allowed_at: Option<DateTime<Utc>>,
+    pub denied_at: Option<DateTime<Utc>>,
+    pub left_at: Option<DateTime<Utc>>,
+    pub note: Option<String>,
+}
+
+impl GuildRow {
+    pub fn allowed(&self) -> bool {
+        self.allowed_at.is_some() && self.denied_at.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleChange {
+    Added,
+    AlreadyPresent,
+    LimitReached,
 }
 
 impl Database {
@@ -103,8 +131,10 @@ impl Database {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<Entry>, sqlx::Error> {
-        let rows = sqlx::query("SELECT interaction_id,user_id,user_name,question,invoked_at FROM talk_runs WHERE guild_id=? AND channel_id=? AND invoked_at>=? AND invoked_at<? AND (status='completed' OR EXISTS (SELECT 1 FROM talk_replies WHERE talk_replies.interaction_id=talk_runs.interaction_id)) ORDER BY invoked_at DESC,interaction_id DESC LIMIT 501")
+        let rows = sqlx::query("SELECT interaction_id,user_id,user_name,question,invoked_at FROM talk_runs WHERE guild_id=? AND channel_id=? AND invoked_at>=? AND invoked_at<? AND (status='completed' OR EXISTS (SELECT 1 FROM talk_replies WHERE talk_replies.interaction_id=talk_runs.interaction_id)) ORDER BY invoked_at DESC,interaction_id DESC LIMIT ?")
             .bind(guild).bind(channel).bind(start.naive_utc()).bind(end.naive_utc())
+            // One more than kept, so `history::merge` can tell that older questions were dropped.
+            .bind((history::MAX_MESSAGES + 1) as u32)
             .fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
@@ -147,6 +177,123 @@ impl Database {
             .bind(if error_code.is_some() { "failed" } else { "completed" }).bind(error_code).bind(id)
             .execute(&self.pool).await?;
         Ok(())
+    }
+}
+
+impl Database {
+    /// Allowlist status and configured roles of one guild. Unknown guilds are not allowed.
+    pub async fn guild_access(&self, guild: u64) -> Result<GuildAccess, sqlx::Error> {
+        let rows = sqlx::query("SELECT g.allowed_at IS NOT NULL AND g.denied_at IS NULL AS allowed,r.kind,r.role_id FROM guilds g LEFT JOIN guild_roles r ON r.guild_id=g.guild_id WHERE g.guild_id=? ORDER BY r.created_at,r.role_id")
+            .bind(guild).fetch_all(&self.pool).await?;
+        let mut access = GuildAccess::default();
+        for row in rows {
+            access.allowed = row.try_get("allowed")?;
+            let kind: Option<String> = row.try_get("kind")?;
+            let role: Option<u64> = row.try_get("role_id")?;
+            match (kind.as_deref().and_then(RoleKind::parse), role) {
+                (Some(RoleKind::Use), Some(role)) => access.use_roles.push(role),
+                (Some(RoleKind::Manage), Some(role)) => access.manage_roles.push(role),
+                _ => {}
+            }
+        }
+        Ok(access)
+    }
+
+    /// Adds the guild to the allowlist, or lifts an earlier denial. Keeps the original
+    /// allowed_at when the guild is already allowed.
+    pub async fn allow_guild(&self, guild: u64, note: Option<&str>) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO guilds (guild_id,allowed_at,note,updated_at) VALUES (?,UTC_TIMESTAMP(3),?,UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE allowed_at=IF(allowed_at IS NOT NULL AND denied_at IS NULL,allowed_at,UTC_TIMESTAMP(3)),denied_at=NULL,note=COALESCE(VALUES(note),note),updated_at=UTC_TIMESTAMP(3)")
+            .bind(guild).bind(note).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Revokes an allowed guild. Returns false if it was not allowed.
+    pub async fn deny_guild(&self, guild: u64) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query("UPDATE guilds SET denied_at=UTC_TIMESTAMP(3),updated_at=UTC_TIMESTAMP(3) WHERE guild_id=? AND allowed_at IS NOT NULL AND denied_at IS NULL")
+            .bind(guild).execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    pub async fn guilds(&self) -> Result<Vec<GuildRow>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT guild_id,allowed_at,denied_at,left_at,note FROM guilds ORDER BY guild_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let at = |row: &sqlx::mysql::MySqlRow, column| {
+            row.try_get::<Option<NaiveDateTime>, _>(column)
+                .map(|value| value.map(|value| value.and_utc()))
+        };
+        rows.iter()
+            .map(|row| {
+                Ok(GuildRow {
+                    guild_id: row.try_get("guild_id")?,
+                    allowed_at: at(row, "allowed_at")?,
+                    denied_at: at(row, "denied_at")?,
+                    left_at: at(row, "left_at")?,
+                    note: row.try_get("note")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn add_guild_role(
+        &self,
+        guild: u64,
+        kind: RoleKind,
+        role: u64,
+        created_by: Option<u64>,
+    ) -> Result<RoleChange, sqlx::Error> {
+        let roles: Vec<u64> =
+            sqlx::query_scalar("SELECT role_id FROM guild_roles WHERE guild_id=? AND kind=?")
+                .bind(guild)
+                .bind(kind.as_str())
+                .fetch_all(&self.pool)
+                .await?;
+        if roles.contains(&role) {
+            return Ok(RoleChange::AlreadyPresent);
+        }
+        if roles.len() >= MAX_ROLES_PER_KIND {
+            return Ok(RoleChange::LimitReached);
+        }
+        let inserted = sqlx::query("INSERT IGNORE INTO guild_roles (guild_id,kind,role_id,created_at,created_by) VALUES (?,?,?,UTC_TIMESTAMP(3),?)")
+            .bind(guild).bind(kind.as_str()).bind(role).bind(created_by)
+            .execute(&self.pool).await?.rows_affected();
+        Ok(if inserted == 1 {
+            RoleChange::Added
+        } else {
+            RoleChange::AlreadyPresent
+        })
+    }
+
+    /// Returns false if the role was not configured.
+    pub async fn remove_guild_role(
+        &self,
+        guild: u64,
+        kind: RoleKind,
+        role: u64,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(
+            sqlx::query("DELETE FROM guild_roles WHERE guild_id=? AND kind=? AND role_id=?")
+                .bind(guild)
+                .bind(kind.as_str())
+                .bind(role)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                == 1,
+        )
+    }
+
+    /// Forgets a role that was deleted in Discord, whatever kinds it was configured for.
+    pub async fn forget_role(&self, guild: u64, role: u64) -> Result<u64, sqlx::Error> {
+        Ok(
+            sqlx::query("DELETE FROM guild_roles WHERE guild_id=? AND role_id=?")
+                .bind(guild)
+                .bind(role)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
     }
 }
 

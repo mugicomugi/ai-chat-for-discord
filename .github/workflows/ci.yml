@@ -55,6 +55,8 @@ jobs:
           docker compose -f compose.test.yaml -p discussion-bot-test up -d --wait
       - name: Persistence after restart test
         run: cargo test --locked --test database persistence_after_restart -- --ignored --exact
+      - name: Guild access test
+        run: cargo test --locked --test database access_and_guilds -- --ignored --exact
 
   # Pull requests (including Dependabot base-image bumps) build the runtime image without pushing.
   docker-build:
