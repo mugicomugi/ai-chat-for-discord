@@ -161,6 +161,7 @@ async fn run() -> Result<()> {
         config.retention_days,
         config.guild_purge_grace_days,
         bot_guilds,
+        client.http.clone(),
         stopped,
     ));
     let manager = client.shard_manager.clone();
@@ -204,6 +205,7 @@ async fn maintenance(
     retention_days: i64,
     grace_days: i64,
     bot_guilds: BotGuilds,
+    http: Arc<serenity::http::Http>,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
@@ -239,12 +241,23 @@ async fn maintenance(
         // Not at startup: a guild that invited the bot again while it was offline is only
         // known once its GUILD_CREATE arrives.
         if !std::mem::replace(&mut startup, false) {
-            purge_left_guilds(&db, now - chrono::Duration::days(grace_days), &bot_guilds).await;
+            purge_left_guilds(
+                &db,
+                &http,
+                now - chrono::Duration::days(grace_days),
+                &bot_guilds,
+            )
+            .await;
         }
     }
 }
 
-async fn purge_left_guilds(db: &Database, cutoff: chrono::DateTime<Utc>, bot_guilds: &BotGuilds) {
+async fn purge_left_guilds(
+    db: &Database,
+    http: &serenity::http::Http,
+    cutoff: chrono::DateTime<Utc>,
+    bot_guilds: &BotGuilds,
+) {
     let guilds = match db.guilds_to_purge(cutoff).await {
         Ok(guilds) => guilds,
         Err(_) => {
@@ -262,8 +275,22 @@ async fn purge_left_guilds(db: &Database, cutoff: chrono::DateTime<Utc>, bot_gui
             tracing::warn!(guild_id, "guild_purge_skipped_bot_present");
             continue;
         }
-        match db.purge_guild(guild_id).await {
-            Ok(purged) => tracing::info!(
+        // The gateway state can lag (a re-invitation racing a READY), so ask Discord itself.
+        match discord_discussion_bot::privacy::bot_in_guild(http, guild_id).await {
+            Some(false) => {}
+            Some(true) => {
+                tracing::warn!(guild_id, "guild_purge_skipped_bot_present");
+                let _ = db.mark_guild_present(guild_id).await;
+                continue;
+            }
+            None => {
+                tracing::warn!(guild_id, "guild_purge_deferred");
+                continue;
+            }
+        }
+        match db.purge_guild(guild_id, Some(cutoff)).await {
+            Ok(None) => {}
+            Ok(Some(purged)) => tracing::info!(
                 guild_id,
                 talk_runs = purged.talk_runs,
                 web_conversations = purged.web_conversations,

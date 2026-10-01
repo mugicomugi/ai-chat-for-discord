@@ -11,6 +11,7 @@
 use std::io::Read;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
 use serenity::{
     all::{GuildId, GuildInfo},
     http::{GuildPagination, Http},
@@ -79,7 +80,13 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
         ["guild", "list"] => list_guilds(&db, &http).await,
         ["guild", "purge", guild, rest @ ..] => {
-            purge_guild(&db, snowflake(guild, "GUILD_ID")?, rest == ["--force"]).await
+            purge_guild(
+                &db,
+                &http,
+                snowflake(guild, "GUILD_ID")?,
+                rest == ["--force"],
+            )
+            .await
         }
         ["privacy", "erase", user] => {
             let user = snowflake(user, "USER_ID")?;
@@ -290,7 +297,7 @@ pub async fn prune_embeddings(
 
 /// Purges a guild's data now instead of after GUILD_PURGE_GRACE_DAYS. Refuses a guild the bot
 /// has not left unless `force`.
-async fn purge_guild(db: &Database, guild: u64, force: bool) -> Result<()> {
+async fn purge_guild(db: &Database, http: &Http, guild: u64, force: bool) -> Result<()> {
     let row = db
         .guilds()
         .await?
@@ -302,10 +309,27 @@ async fn purge_guild(db: &Database, guild: u64, force: bool) -> Result<()> {
              guild first, or pass --force to purge its data while the bot stays"
         );
     }
-    let purged = db
-        .purge_guild(guild)
+    if !force {
+        match privacy::bot_in_guild(http, guild).await {
+            Some(false) => {}
+            Some(true) => bail!(
+                "Discord says the bot is still in guild {guild}; nothing was purged (pass \
+                 --force to purge its data while the bot stays)"
+            ),
+            None => bail!(
+                "could not ask Discord whether the bot is still in guild {guild}; nothing was \
+                 purged (check DISCORD_TOKEN and the network, or pass --force)"
+            ),
+        }
+    }
+    let left_before = (!force).then(Utc::now);
+    let Some(purged) = db
+        .purge_guild(guild, left_before)
         .await
-        .context("purging the guild failed; run the command again")?;
+        .context("purging the guild failed; run the command again")?
+    else {
+        bail!("the bot has not left guild {guild}; nothing was purged");
+    };
     println!(
         "purged guild {guild}: {} /talk records, {} web conversations, {} knowledge documents, {} role settings",
         purged.talk_runs, purged.web_conversations, purged.kb_documents, purged.guild_roles

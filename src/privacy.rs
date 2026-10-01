@@ -107,6 +107,12 @@ impl Database {
                 .rows_affected())
         };
         let talk_runs = run("DELETE FROM talk_runs WHERE user_id=? AND (? IS NULL OR invoked_at<=?) AND status NOT IN ('running','delivering')").await?;
+        let mut talk_runs = talk_runs;
+        if until.is_some() {
+            // Re-applying the ledger after a restore: a run the backup caught mid-answer has
+            // long finished (no answer takes an hour), and `recover` would otherwise keep it.
+            talk_runs += run("DELETE FROM talk_runs WHERE user_id=? AND (? IS NULL OR invoked_at<=?) AND status IN ('running','delivering') AND invoked_at<UTC_TIMESTAMP(3)-INTERVAL 1 HOUR").await?;
+        }
         let web_conversations =
             run("DELETE FROM web_conversations WHERE user_id=? AND (? IS NULL OR created_at<=?)")
                 .await?;
@@ -188,8 +194,13 @@ impl Database {
 
     /// The bot is in the guild (again). Returns true if it had been recorded as left.
     pub async fn mark_guild_present(&self, guild: u64) -> Result<bool, sqlx::Error> {
-        Ok(sqlx::query("UPDATE guilds SET left_at=NULL,updated_at=UTC_TIMESTAMP(3) WHERE guild_id=? AND left_at IS NOT NULL")
-            .bind(guild).execute(&self.pool).await?.rows_affected() == 1)
+        let rejoined = sqlx::query("UPDATE guilds SET left_at=NULL,updated_at=UTC_TIMESTAMP(3) WHERE guild_id=? AND left_at IS NOT NULL")
+            .bind(guild).execute(&self.pool).await?.rows_affected() == 1;
+        sqlx::query("UPDATE guilds SET seen_at=UTC_TIMESTAMP(3) WHERE guild_id=?")
+            .bind(guild)
+            .execute(&self.pool)
+            .await?;
+        Ok(rejoined)
     }
 
     /// Records as left the known guilds of this shard (`shard` is its ID and the shard count)
@@ -200,10 +211,11 @@ impl Database {
         present: &HashSet<u64>,
         shard: (u32, u32),
     ) -> Result<Vec<u64>, sqlx::Error> {
-        let tracked: Vec<u64> =
-            sqlx::query_scalar("SELECT guild_id FROM guilds WHERE left_at IS NULL")
-                .fetch_all(&self.pool)
-                .await?;
+        let tracked: Vec<u64> = sqlx::query_scalar(
+            "SELECT guild_id FROM guilds WHERE left_at IS NULL AND seen_at IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let missing: Vec<u64> = tracked
             .into_iter()
             .filter(|guild| shard_of(*guild, shard.1) == shard.0 && !present.contains(guild))
@@ -225,7 +237,26 @@ impl Database {
     /// knowledge documents (chunks and vectors cascade) and role settings, and takes it off the
     /// allowlist, so that a new invitation needs `ops guild allow` again. The guilds row stays,
     /// with a note.
-    pub async fn purge_guild(&self, guild: u64) -> Result<GuildPurge, sqlx::Error> {
+    ///
+    /// With `left_before`, only a guild the bot left before then is purged (`None` otherwise);
+    /// it is checked again before the allowlist entry and roles go, in case the bot was
+    /// invited back meanwhile. `None` purges unconditionally (`ops guild purge --force`).
+    pub async fn purge_guild(
+        &self,
+        guild: u64,
+        left_before: Option<DateTime<Utc>>,
+    ) -> Result<Option<GuildPurge>, sqlx::Error> {
+        let cutoff = left_before.map(|at| at.naive_utc());
+        const LEFT: &str = "SELECT COUNT(*) FROM guilds WHERE guild_id=? AND (? IS NULL OR (left_at IS NOT NULL AND left_at<?))";
+        let left: i64 = sqlx::query_scalar(LEFT)
+            .bind(guild)
+            .bind(cutoff)
+            .bind(cutoff)
+            .fetch_one(&self.pool)
+            .await?;
+        if cutoff.is_some() && left == 0 {
+            return Ok(None);
+        }
         // The bulky deletions are statements of their own: a knowledge base alone can be
         // thousands of chunks and vectors, and none of these rows depend on each other.
         let talk_runs = sqlx::query(
@@ -247,6 +278,21 @@ impl Database {
             .rows_affected();
         let mut tx = self.pool.begin().await?;
         lock_guild(&mut tx, guild).await?;
+        let still_left: i64 = sqlx::query_scalar(LEFT)
+            .bind(guild)
+            .bind(cutoff)
+            .bind(cutoff)
+            .fetch_one(&mut *tx)
+            .await?;
+        if cutoff.is_some() && still_left == 0 {
+            // Invited back during the purge: keep its allowlist entry and roles.
+            return Ok(Some(GuildPurge {
+                talk_runs,
+                web_conversations,
+                kb_documents,
+                guild_roles: 0,
+            }));
+        }
         let guild_roles = sqlx::query("DELETE FROM guild_roles WHERE guild_id=?")
             .bind(guild)
             .execute(&mut *tx)
@@ -255,12 +301,26 @@ impl Database {
         sqlx::query("UPDATE guilds SET allowed_at=NULL,note=LEFT(CONCAT('purged ',DATE_FORMAT(UTC_TIMESTAMP(),'%Y-%m-%d'),' after the bot left',IF(note IS NULL OR note LIKE 'purged %','',CONCAT('; ',note))),200),updated_at=UTC_TIMESTAMP(3) WHERE guild_id=?")
             .bind(guild).execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(GuildPurge {
+        Ok(Some(GuildPurge {
             talk_runs,
             web_conversations,
             kb_documents,
             guild_roles,
-        })
+        }))
+    }
+}
+
+/// Asks Discord whether the bot is still in `guild`: `Some(false)` only for a definite answer
+/// (403 or 404), `None` when Discord could not be asked.
+pub async fn bot_in_guild(http: &serenity::http::Http, guild: u64) -> Option<bool> {
+    match http.get_guild(serenity::all::GuildId::new(guild)).await {
+        Ok(_) => Some(true),
+        Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)))
+            if matches!(response.status_code.as_u16(), 403 | 404) =>
+        {
+            Some(false)
+        }
+        Err(_) => None,
     }
 }
 
@@ -377,11 +437,17 @@ pub async fn apply_ledger(db: &Database, entries: &[LedgerEntry]) -> Result<Appl
                 + erasure.guild_roles;
         }
         for document in &entry.kb_documents {
-            applied.kb_documents += sqlx::query("DELETE FROM kb_documents WHERE id=?")
-                .bind(document)
-                .execute(&db.pool)
-                .await?
-                .rows_affected();
+            // A restore rewinds the id counter, so a later upload can reuse the id: only a
+            // document that existed when the line was written is the one it names.
+            let until = entry.erased_at.map(|at| at.naive_utc());
+            applied.kb_documents +=
+                sqlx::query("DELETE FROM kb_documents WHERE id=? AND (? IS NULL OR created_at<=?)")
+                    .bind(document)
+                    .bind(until)
+                    .bind(until)
+                    .execute(&db.pool)
+                    .await?
+                    .rows_affected();
         }
     }
     Ok(applied)

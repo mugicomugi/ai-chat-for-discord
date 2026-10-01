@@ -2285,19 +2285,48 @@ async fn privacy_and_guild_purge() {
     login_at(&db, user, restored).await;
     add_talk_run(&db, 975_016, kept, user, true).await;
     let since = add_conversation(&db, kept, user).await;
+    // The backup also caught a run of the user mid-answer, long before the erasure.
+    add_talk_run_at(
+        &db,
+        975_017,
+        kept,
+        user,
+        false,
+        erased_at - chrono::Duration::hours(2),
+    )
+    .await;
     let restored_document = add_document(&db, kept, other, "restored").await;
+    // A document line older than the document: after a restore the id can be reused by a
+    // later upload, which must survive.
+    let reused_id = add_document(&db, kept, other, "reused id").await;
     let mut entries = privacy::parse_ledger(&text).unwrap();
+    let today = Utc::now().format("%Y-%m-%d");
     entries.extend(
-        privacy::parse_ledger(&format!("2026-09-01 kb_document={restored_document}")).unwrap(),
+        privacy::parse_ledger(&format!(
+            "{today} kb_document={restored_document}\n2026-09-01 kb_document={reused_id}"
+        ))
+        .unwrap(),
     );
     let applied = privacy::apply_ledger(&db, &entries).await.unwrap();
     assert_eq!(
         applied,
         privacy::Applied {
             users: 1,
-            rows: 3,
+            rows: 4,
             kb_documents: 1
         }
+    );
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM kb_documents WHERE id=?", reused_id).await,
+        1
+    );
+    assert_eq!(
+        rows(
+            "SELECT COUNT(*) FROM talk_runs WHERE interaction_id=?",
+            975_017
+        )
+        .await,
+        0
     );
     let holdings = db.privacy_holdings(user).await.unwrap();
     assert_eq!(
@@ -2399,6 +2428,14 @@ async fn privacy_and_guild_purge() {
         .map(|row| row.guild_id)
         .collect();
     present.remove(&away);
+    // Allowlisted before the bot was ever invited: not counted as left.
+    let never_seen = 975_500_u64;
+    sqlx::query("DELETE FROM guilds WHERE guild_id=?")
+        .bind(never_seen)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.allow_guild(never_seen, None).await.unwrap();
     let other_shard = (privacy::shard_of(away, 2) + 1) % 2;
     assert!(
         db.reconcile_guilds(&present, (other_shard, 2))
@@ -2407,6 +2444,7 @@ async fn privacy_and_guild_purge() {
             .is_empty()
     );
     assert_eq!(db.reconcile_guilds(&present, (0, 1)).await.unwrap(), [away]);
+    assert_eq!(left_at(never_seen).await.unwrap(), None);
     assert!(left_at(away).await.unwrap().is_some());
     assert!(db.mark_guild_present(away).await.unwrap());
 
@@ -2422,14 +2460,16 @@ async fn privacy_and_guild_purge() {
     let due = db.guilds_to_purge(cutoff).await.unwrap();
     assert!(due.contains(&left));
     assert!(!due.contains(&kept) && !due.contains(&away) && !due.contains(&unknown));
+    // Only a guild that left before the cutoff is purged.
+    assert_eq!(db.purge_guild(kept, Some(cutoff)).await.unwrap(), None);
     assert_eq!(
-        db.purge_guild(left).await.unwrap(),
-        privacy::GuildPurge {
+        db.purge_guild(left, Some(cutoff)).await.unwrap(),
+        Some(privacy::GuildPurge {
             talk_runs: 1,
             web_conversations: 1,
             kb_documents: 1,
             guild_roles: 1,
-        }
+        })
     );
     assert_eq!(
         rows(
@@ -2457,7 +2497,7 @@ async fn privacy_and_guild_purge() {
     );
     assert_eq!(
         rows("SELECT COUNT(*) FROM kb_documents WHERE guild_id=?", kept).await,
-        2
+        3
     );
     assert!(db.guild_access(kept).await.unwrap().allowed);
 
