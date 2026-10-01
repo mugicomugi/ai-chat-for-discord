@@ -16,7 +16,7 @@ use serenity::{
 use crate::{
     access::{MAX_ROLES_PER_KIND, RoleKind},
     config::Config,
-    db::{Database, RoleChange},
+    db::{Database, RoleChange, parse_snowflake},
 };
 
 pub const USAGE: &str = "usage:
@@ -241,11 +241,7 @@ fn role_label(names: &Option<Vec<(u64, String)>>, guild: u64, role: u64) -> Stri
 }
 
 fn snowflake(value: &str, what: &str) -> Result<u64> {
-    value
-        .parse::<u64>()
-        .ok()
-        .filter(|id| *id != 0 && value.bytes().all(|b| b.is_ascii_digit()))
-        .with_context(|| format!("{what} must be a nonzero numeric Discord ID"))
+    parse_snowflake(value).with_context(|| format!("{what} must be a nonzero numeric Discord ID"))
 }
 
 #[cfg(test)]

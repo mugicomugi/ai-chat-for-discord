@@ -7,3 +7,4 @@ pub mod history;
 pub mod limits;
 pub mod ops;
 pub mod output;
+pub mod web;

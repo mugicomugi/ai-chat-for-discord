@@ -1,0 +1,28 @@
+# HTTPS in front of the bot's web UI (compose.yaml service "caddy", profile "web").
+# DOMAIN comes from .env; Caddy obtains and renews the certificate itself (ports 80/443).
+{
+	# HTTP/1.1 and HTTP/2 only, so UDP 443 (HTTP/3) stays closed.
+	servers {
+		protocols h1 h2
+	}
+	# No admin API: restart the container after editing this file.
+	admin off
+}
+
+{$DOMAIN} {
+	# Above the knowledge upload limit (5 MiB, M3); the bot enforces its own limits as well.
+	request_body {
+		max_size 6MB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+		-Via
+	}
+	# No `encode`: compressing HTTPS responses that mix secrets and user input invites
+	# BREACH-style attacks, and the pages are small.
+	# flush_interval -1 passes streamed responses (server-sent events, M4) through unbuffered.
+	reverse_proxy bot:8080 {
+		flush_interval -1
+	}
+}

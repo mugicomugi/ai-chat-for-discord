@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{
     ConnectOptions, MySqlPool, Row,
     migrate::MigrateError,
@@ -45,6 +46,50 @@ impl GuildRow {
     pub fn allowed(&self) -> bool {
         self.allowed_at.is_some() && self.denied_at.is_none()
     }
+}
+
+/// Most web sessions one user may hold; logging in again drops the oldest.
+pub const MAX_SESSIONS_PER_USER: usize = 10;
+/// Web sessions last this long from login and are never extended.
+pub const SESSION_DAYS: i64 = 7;
+
+/// A logged-in web user. The token itself is never stored, only its SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSession {
+    pub user_id: u64,
+    pub user_name: String,
+    /// Allowlisted guilds the user was a member of at login.
+    pub guilds: Vec<SessionGuild>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGuild {
+    #[serde(with = "id_string")]
+    pub id: u64,
+    pub name: String,
+}
+
+/// Discord IDs travel as JSON strings: JavaScript numbers lose precision above 2^53.
+pub mod id_string {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(id: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(id)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        super::parse_snowflake(&value).ok_or_else(|| D::Error::custom("invalid Discord ID"))
+    }
+}
+
+/// A nonzero Discord ID written in plain decimal digits (no sign, spaces or exponent).
+pub fn parse_snowflake(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok().filter(|id| *id != 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +154,12 @@ impl Database {
         .execute(&self.pool)
         .await?
         .rows_affected())
+    }
+
+    /// Health check: the database answers a trivial query.
+    pub async fn ping(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
     }
 
     /// A duplicate interaction does not start another generation or send another reply.
@@ -297,6 +348,127 @@ impl Database {
     }
 }
 
+impl Database {
+    /// Stores a new web session and drops the user's oldest sessions beyond
+    /// `MAX_SESSIONS_PER_USER`, as well as their expired ones.
+    pub async fn create_session(
+        &self,
+        token_hash: &[u8; 32],
+        user_id: u64,
+        user_name: &str,
+        guilds: &[SessionGuild],
+        now: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO web_sessions (token_hash,user_id,user_name,guilds,created_at,expires_at) VALUES (?,?,?,?,?,?)")
+            .bind(token_hash.as_slice()).bind(user_id).bind(user_name).bind(sqlx::types::Json(guilds))
+            .bind(now.naive_utc()).bind((now + chrono::Duration::days(SESSION_DAYS)).naive_utc())
+            .execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM web_sessions WHERE user_id=? AND expires_at<=?")
+            .bind(user_id)
+            .bind(now.naive_utc())
+            .execute(&mut *tx)
+            .await?;
+        // A locking read: concurrent logins of the same user wait for each other here.
+        let hashes: Vec<Vec<u8>> = sqlx::query_scalar("SELECT token_hash FROM web_sessions WHERE user_id=? ORDER BY created_at DESC,token_hash DESC FOR UPDATE")
+            .bind(user_id).fetch_all(&mut *tx).await?;
+        for hash in hashes.iter().skip(MAX_SESSIONS_PER_USER) {
+            sqlx::query("DELETE FROM web_sessions WHERE token_hash=?")
+                .bind(hash)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
+    /// The unexpired session with this token hash.
+    pub async fn session(
+        &self,
+        token_hash: &[u8; 32],
+        now: DateTime<Utc>,
+    ) -> Result<Option<WebSession>, sqlx::Error> {
+        let Some(row) = sqlx::query("SELECT user_id,user_name,guilds,expires_at FROM web_sessions WHERE token_hash=? AND expires_at>?")
+            .bind(token_hash.as_slice()).bind(now.naive_utc()).fetch_optional(&self.pool).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(WebSession {
+            user_id: row.try_get("user_id")?,
+            user_name: row.try_get("user_name")?,
+            guilds: row
+                .try_get::<sqlx::types::Json<Vec<SessionGuild>>, _>("guilds")?
+                .0,
+            expires_at: row.try_get::<NaiveDateTime, _>("expires_at")?.and_utc(),
+        }))
+    }
+
+    /// Returns false if there was no such session.
+    pub async fn delete_session(&self, token_hash: &[u8; 32]) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query("DELETE FROM web_sessions WHERE token_hash=?")
+            .bind(token_hash.as_slice())
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            == 1)
+    }
+
+    pub async fn purge_sessions(&self, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+        Ok(sqlx::query("DELETE FROM web_sessions WHERE expires_at<=?")
+            .bind(now.naive_utc())
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
+    /// IDs of all allowlisted guilds (the operator's list is short).
+    pub async fn allowed_guild_ids(&self) -> Result<Vec<u64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT guild_id FROM guilds WHERE allowed_at IS NOT NULL AND denied_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Replaces both role kinds of a guild in one transaction. Roles that stay configured keep
+    /// their original creator and time. The caller validates the lists (existence, limits).
+    pub async fn replace_guild_roles(
+        &self,
+        guild: u64,
+        use_roles: &[u64],
+        manage_roles: &[u64],
+        changed_by: u64,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let current =
+            sqlx::query("SELECT kind,role_id FROM guild_roles WHERE guild_id=? FOR UPDATE")
+                .bind(guild)
+                .fetch_all(&mut *tx)
+                .await?;
+        for (kind, roles) in [(RoleKind::Use, use_roles), (RoleKind::Manage, manage_roles)] {
+            for row in &current {
+                let row_kind: String = row.try_get("kind")?;
+                let role: u64 = row.try_get("role_id")?;
+                if row_kind == kind.as_str() && !roles.contains(&role) {
+                    sqlx::query(
+                        "DELETE FROM guild_roles WHERE guild_id=? AND kind=? AND role_id=?",
+                    )
+                    .bind(guild)
+                    .bind(kind.as_str())
+                    .bind(role)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            for role in roles {
+                sqlx::query("INSERT IGNORE INTO guild_roles (guild_id,kind,role_id,created_at,created_by) VALUES (?,?,?,UTC_TIMESTAMP(3),?)")
+                    .bind(guild).bind(kind.as_str()).bind(role).bind(changed_by)
+                    .execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await
+    }
+}
+
 /// Classifies a migration failure for logs without SQL text or driver messages. A `dirty`
 /// version means a DDL statement failed part-way (MariaDB DDL is not transactional); see the
 /// recovery steps in docs/runbook.md.
@@ -318,6 +490,31 @@ pub fn migrate_error_summary(error: &MigrateError) -> (&'static str, Option<i64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snowflakes_round_trip_as_strings() {
+        assert_eq!(parse_snowflake("18446744073709551615"), Some(u64::MAX));
+        for value in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            " 1",
+            "1e3",
+            "18446744073709551616",
+            "１",
+        ] {
+            assert_eq!(parse_snowflake(value), None, "{value}");
+        }
+        let guild = SessionGuild {
+            id: 1_234_567_890_123_456_789,
+            name: "サーバー".into(),
+        };
+        let json = serde_json::to_string(&guild).unwrap();
+        assert_eq!(json, r#"{"id":"1234567890123456789","name":"サーバー"}"#);
+        assert_eq!(serde_json::from_str::<SessionGuild>(&json).unwrap(), guild);
+        assert!(serde_json::from_str::<SessionGuild>(r#"{"id":12,"name":"x"}"#).is_err());
+    }
 
     #[test]
     fn migrate_errors_are_summarized_without_messages() {

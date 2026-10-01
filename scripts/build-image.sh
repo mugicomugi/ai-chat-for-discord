@@ -9,8 +9,9 @@ cd "$(dirname "$0")/.."
 
 # Everything compiled into the image must be committed (untracked source files included),
 # because the tag names the commit.
-if [[ -n "$(git status --porcelain -- src migrations templates static Cargo.toml Cargo.lock Dockerfile .cargo)" ]]; then
-    echo "build-image.sh: commit or stash changes under src/, migrations/ … first; the image tag names a commit" >&2
+# static/ and docs/ are compiled in too (the web UI and its /privacy and /terms pages).
+if [[ -n "$(git status --porcelain -- src migrations static docs Cargo.toml Cargo.lock Dockerfile .cargo)" ]]; then
+    echo "build-image.sh: commit or stash changes under src/, migrations/, static/, docs/ … first; the image tag names a commit" >&2
     exit 1
 fi
 tag="discord-discussion-bot:git-$(git rev-parse --short=12 HEAD)"

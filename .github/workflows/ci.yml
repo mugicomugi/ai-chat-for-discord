@@ -57,6 +57,12 @@ jobs:
         run: cargo test --locked --test database persistence_after_restart -- --ignored --exact
       - name: Guild access test
         run: cargo test --locked --test database access_and_guilds -- --ignored --exact
+      - name: Web session test
+        run: cargo test --locked --test web web_sessions -- --ignored --exact
+      - name: Web login test
+        run: cargo test --locked --test web web_login_keeps_only_allowlisted_guilds -- --ignored --exact
+      - name: Web role settings test
+        run: cargo test --locked --test web web_role_settings -- --ignored --exact
 
   # Pull requests (including Dependabot base-image bumps) build the runtime image without pushing.
   docker-build:

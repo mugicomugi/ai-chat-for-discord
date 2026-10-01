@@ -25,6 +25,19 @@ services:
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
       REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-180}
       RUST_LOG: ${RUST_LOG:-discord_discussion_bot=info}
+      # Web UI: on only when all three are set (docs/runbook.md); empty values keep it off.
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      # Caddy proxies to bot:8080; the port is not published on the host.
+      WEB_BIND: 0.0.0.0:8080
+    # GET /healthz (database and Discord gateway); always healthy while the web UI is off.
+    healthcheck:
+      test: [CMD, /app/bot, healthcheck]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     depends_on:
       db:
         condition: service_healthy
@@ -82,8 +95,38 @@ services:
         max-size: 10m
         max-file: "3"
 
+  caddy:
+    # HTTPS for the web UI. Started only with COMPOSE_PROFILES=web in .env (docs/runbook.md).
+    # Pinned by digest; Dependabot (docker-compose) proposes updates.
+    image: caddy:2.11.4-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+    profiles: [web]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 96m
+    pids_limit: 64
+    # TCP only: the Caddyfile disables HTTP/3, so UDP 443 stays closed.
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [edge]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
 networks:
-  # Outbound access for the bot (Discord, Ollama); Caddy joins this network in a later stage.
+  # Outbound access for the bot (Discord, Ollama) and Caddy's route to it.
   edge: {}
   # Database traffic only; no route to the internet.
   backend:
@@ -91,3 +134,6 @@ networks:
 
 volumes:
   mariadb_data:
+  # Certificates and ACME account; keep them to avoid hitting Let's Encrypt rate limits.
+  caddy_data:
+  caddy_config:

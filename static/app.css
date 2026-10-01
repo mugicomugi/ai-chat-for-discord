@@ -1,0 +1,400 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --text: #1d2125;
+  --muted: #5d6670;
+  --border: #d9dde3;
+  --accent: #4752c4;
+  --accent-text: #ffffff;
+  --ok: #1f7a46;
+  --ok-bg: #e3f4ea;
+  --off: #5d6670;
+  --off-bg: #eceef1;
+  --warn: #8a5300;
+  --warn-bg: #fff3dc;
+  --error: #b42318;
+  --error-bg: #fdecea;
+  font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", Meiryo, sans-serif;
+  line-height: 1.6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17191c;
+    --surface: #212429;
+    --text: #e7e9ec;
+    --muted: #a3abb5;
+    --border: #3a3f46;
+    --accent: #7f88ef;
+    --accent-text: #0f1115;
+    --ok: #6fd39b;
+    --ok-bg: #1d3a2a;
+    --off: #a3abb5;
+    --off-bg: #2c3036;
+    --warn: #f2c26b;
+    --warn-bg: #3d3018;
+    --error: #ff8f84;
+    --error-bg: #42201d;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+}
+
+a {
+  color: var(--accent);
+}
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  padding: 0.75rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  color: var(--text);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.account {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.user {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 14rem;
+}
+
+.app,
+.document {
+  width: 100%;
+  max-width: 56rem;
+  margin: 0 auto;
+  padding: 1rem;
+  flex: 1;
+}
+
+.document table {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+}
+
+.document th,
+.document td {
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.6rem;
+  vertical-align: top;
+}
+
+.document code {
+  overflow-wrap: anywhere;
+}
+
+.document blockquote {
+  margin: 1rem 0;
+  padding: 0.5rem 1rem;
+  border-left: 4px solid var(--warn);
+  background: var(--warn-bg);
+}
+
+.back {
+  margin-top: 2rem;
+}
+
+.footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 1rem;
+  padding: 1rem;
+  font-size: 0.875rem;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0.5rem 0 1rem;
+  overflow-wrap: anywhere;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.crumb {
+  margin: 0;
+}
+
+button,
+.button {
+  display: inline-block;
+  font: inherit;
+  padding: 0.5rem 1rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+button.primary,
+.button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.link {
+  padding: 0.25rem 0.5rem;
+  border: none;
+  background: none;
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.cards {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: 0.75rem;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+.card .button {
+  align-self: flex-start;
+}
+
+.card-title {
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.badge {
+  font-size: 0.8rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+}
+
+.badge.ok {
+  color: var(--ok);
+  background: var(--ok-bg);
+}
+
+.badge.off {
+  color: var(--off);
+  background: var(--off-bg);
+}
+
+.badge.warn {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.empty {
+  padding: 1rem;
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 0.5rem;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+
+.tab {
+  padding: 0.5rem 0.75rem;
+  text-decoration: none;
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+}
+
+.tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.filter {
+  width: 100%;
+  font: inherit;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.role-group {
+  margin: 0 0 1rem;
+  padding: 0.75rem 1rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  min-width: 0;
+}
+
+.role-group legend {
+  font-weight: 700;
+  padding: 0 0.25rem;
+}
+
+.counter {
+  font-weight: 400;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.counter.over {
+  color: var(--error);
+}
+
+.role-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+  gap: 0.25rem 1rem;
+  max-height: 24rem;
+  overflow-y: auto;
+}
+
+.role-list label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.25rem;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.role-list input {
+  width: 1.15rem;
+  height: 1.15rem;
+  flex: none;
+}
+
+.role-name {
+  overflow-wrap: anywhere;
+}
+
+.dot {
+  flex: none;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: var(--off-bg);
+  border: 1px solid var(--border);
+}
+
+.tag {
+  flex: none;
+  font-size: 0.75rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 0.3rem;
+  padding: 0 0.3rem;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.status {
+  margin: 0;
+}
+
+.status:empty {
+  display: none;
+}
+
+.status.ok {
+  color: var(--ok);
+}
+
+.status.warn {
+  color: var(--warn);
+  background: var(--warn-bg);
+  padding: 0.4rem 0.6rem;
+  border-radius: 0.4rem;
+  margin-bottom: 0.5rem;
+}
+
+.status.error {
+  color: var(--error);
+  background: var(--error-bg);
+  padding: 0.4rem 0.6rem;
+  border-radius: 0.4rem;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+@media (max-width: 30rem) {
+  h1 {
+    font-size: 1.25rem;
+  }
+
+  .app,
+  .document {
+    padding: 0.75rem;
+  }
+
+  .actions button {
+    width: 100%;
+  }
+}

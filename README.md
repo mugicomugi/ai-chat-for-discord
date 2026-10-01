@@ -26,7 +26,7 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 1. そのサーバーが運営者の許可リストに入っている（`ops guild allow`、[docs/runbook.md](docs/runbook.md) の「サーバーを追加する」）。
 2. そのサーバーで「利用ロール」に設定されたロールを持っている。**利用ロールが未設定のサーバーでは誰も使えません。** 全員に許可する場合は `@everyone` を利用ロールにします。
 
-利用ロールは、各サーバーで「サーバー管理」権限を持つ人が `/config` で設定します（応答は本人にだけ表示されます）。
+利用ロールは、各サーバーで「サーバー管理」権限を持つ人が `/config` か [Web管理画面](#web管理画面) で設定します（`/config` の応答は本人にだけ表示されます）。
 
 ```text
 /config role-add role:@メンバー
@@ -35,6 +35,7 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 /config show
 ```
 
+- `/config show` は、Web管理画面を有効にしている場合、そのサーバーの設定画面のURLも表示します。
 - 「ナレッジ管理」ロールは、今後追加するナレッジベースの資料を管理できるロールです（[docs/roadmap.md](docs/roadmap.md)）。ロールの設定を変更できるのは、サーバーのオーナーと「管理者」「サーバー管理」権限を持つ人だけです。
 - Discordで削除したロールは、設定からも自動で外れます。
 - 利用できない人が `/talk` を実行すると、理由が本人にだけ表示されます。履歴の取得・DBへの保存・AIの呼び出しは行いません。
@@ -105,6 +106,52 @@ docker compose up -d
 
 設定変更後は `docker compose up -d` で反映します。
 
+## Web管理画面
+
+Discordアカウントでログインして、Botを導入しているサーバーでの自分の権限を確認し、サーバー管理者は利用ロール・ナレッジ管理ロールを設定できる画面です（今後ナレッジ管理とWebチャットを追加します。[docs/roadmap.md](docs/roadmap.md)）。BotとMariaDBに加えてCaddy（HTTPS）を動かし、`https://<ドメイン>/` で公開します。**任意の機能**で、下の3つの環境変数を設定しなければ起動せず、Botはこれまでどおり動きます。本番での公開手順（DNS、OCIのポート、Caddy、監視）は [docs/runbook.md](docs/runbook.md) の「12. Web 管理画面を公開する」を参照してください。
+
+### 設定
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) のアプリの **OAuth2** で次を行います。
+   - **Redirects** に `https://<ドメイン>/auth/callback` を追加して保存する（1文字でも違うとログインできません）。
+   - **Client ID** を控え、**Client Secret** を発行（Reset Secret）して控える。Client Secret はBotトークンと同じく秘密情報です。
+2. `.env` に追加します。
+
+   ```dotenv
+   DISCORD_CLIENT_ID=123456789012345678
+   DISCORD_CLIENT_SECRET=your_client_secret
+   PUBLIC_BASE_URL=https://bot.example.com
+   DOMAIN=bot.example.com
+   COMPOSE_PROFILES=web
+   ```
+
+3. `docker compose up -d` で、Botの再作成とCaddyの起動を行います。
+
+| 変数 | 既定 | 内容 |
+| --- | --- | --- |
+| `DISCORD_CLIENT_ID` / `DISCORD_CLIENT_SECRET` | なし | OAuth2 の Client ID と Client Secret |
+| `PUBLIC_BASE_URL` | なし | 画面のURL（`https://<ドメイン>`、パスなし）。`https` のみ。手元の確認用に `http://localhost[:ポート]` だけ例外 |
+| `WEB_BIND` | `0.0.0.0:8080` | Botが待ち受けるアドレス。Composeでは `0.0.0.0:8080` に固定（ホストには公開せず、Caddyだけが接続）。`cargo run` で手元から使うときだけ設定します |
+| `DOMAIN` | なし | Caddyが証明書を取得するドメイン（`PUBLIC_BASE_URL` のホスト名と同じ） |
+| `COMPOSE_PROFILES` | なし | `web` でCaddyを起動します |
+
+`DISCORD_CLIENT_ID`・`DISCORD_CLIENT_SECRET`・`PUBLIC_BASE_URL` は3つそろうと有効になり、一部だけ設定するとBotは起動エラーになります。
+
+### 仕様
+
+- **ログイン**：Discordの認可画面（スコープ `identify guilds`）で、ユーザーIDと名前、参加しているサーバーの一覧だけを読み取ります。Discordのアクセストークンは読み取り後すぐに無効化（revoke）し、保存しません。
+- **セッション**：ログインのたびに新しいランダムなトークンを発行し、Cookie（`__Host-session`、Secure・HttpOnly・SameSite=Lax）に入れます。DBにはトークンのSHA-256だけを保存します。有効期限はログインから7日で、使っても延長しません。1人10件まで（超えると古いものから削除）。期限切れのセッションは1時間ごとに削除します。
+- **表示するサーバー**：ログイン時に参加していて、運営者の許可リストに入っていて、Botが参加しているサーバーだけです。一覧はログイン時点のものなので、新しく参加したサーバーはログインし直すと表示されます。
+- **権限**：`/talk` と同じ判定です。ロール設定を変更できるのはオーナーと「管理者」「サーバー管理」権限を持つ人だけで、Botの利用には利用ロールが必要です。メンバーのロールと権限はBotトークンでDiscordから取得し、60秒（サーバーのロールの定義とオーナーは5分。Discordでロールが作成・変更・削除されると即破棄）キャッシュします。ロールを外された人の画面上の権限は最大60秒残ります。ロールの設定自体はDBから毎回読むので、保存すると `/talk` にもすぐ反映されます。
+- **ロール設定の保存**：利用ロールとナレッジ管理ロールを1回の操作でまとめて置き換えます（各25個まで。サーバーに存在しないロールは保存できません）。Discordで削除済みのロールが設定に残っていた場合は、保存すると外れます。
+- **安全対策**：インラインスクリプトを使わず、外部のスクリプト・画像を読み込まない Content-Security-Policy、`X-Content-Type-Options: nosniff` などのヘッダーを付けます。GET以外のリクエストは `Origin` が `PUBLIC_BASE_URL` と一致しなければ拒否し、JSONの送信には `Content-Type: application/json` を必須にしています（CSRF対策）。HTTPS・HSTSはCaddyが担当します。
+- **ページ**：`/privacy` と `/terms` で [docs/privacy.md](docs/privacy.md) と [docs/terms.md](docs/terms.md) を表示します（イメージに組み込むので、変更はイメージの再ビルドで反映されます）。`/healthz` は外部監視用です（DBとDiscordへの接続が正常なら200）。
+- 画面はビルド不要の素のHTML/JS/CSS（`static/`）で、バイナリに組み込まれます。将来のMarkdown表示用に [marked](https://github.com/markedjs/marked) と [DOMPurify](https://github.com/cure53/DOMPurify) を `static/vendor/` に同梱しています（ライセンスは `static/vendor/LICENSES.txt`）。
+
+### 手元で試す
+
+Developer Portal の Redirects に `http://localhost:8080/auth/callback` も追加し、`.env` で `PUBLIC_BASE_URL=http://localhost:8080` と `WEB_BIND=127.0.0.1:8080` を設定して `cargo run` します（このときCookieは `__Host-` なし・Secureなしになります）。
+
 ## 履歴・検索・保存の仕様
 
 - 参照期間は `/talk` の呼び出し日時を基準とし、開始時刻を含み、呼び出し時刻以降の投稿は含みません。スレッドと親チャンネルは独立しています。
@@ -147,6 +194,9 @@ docker compose -f compose.test.yaml -p discussion-bot-test restart db-test
 docker compose -f compose.test.yaml -p discussion-bot-test up -d --wait
 cargo test --locked --test database persistence_after_restart -- --ignored --exact
 cargo test --locked --test database access_and_guilds -- --ignored --exact
+cargo test --locked --test web web_sessions -- --ignored --exact
+cargo test --locked --test web web_login_keeps_only_allowlisted_guilds -- --ignored --exact
+cargo test --locked --test web web_role_settings -- --ignored --exact
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
@@ -174,6 +224,7 @@ cargo test --locked --test live_ollama -- --ignored
 4. `web_search:true` で検索を明示的に依頼すると出典付きで回答する。省略時・`false` では検索しない。
 5. 別チャンネル・親チャンネルの会話がスレッド内の文脈へ混入しない。
 6. 同じチャンネルでの連続呼び出し、長文、権限不足、再起動後の会話継続を確認する。
+7. Web管理画面を有効にした場合：ログイン後のCookieが `__Host-session`（Secure・HttpOnly・SameSite=Lax）であること、ブラウザーの開発者ツールのコンソールにCSP違反が出ないこと、「サーバー管理」権限のないアカウントにはロール設定が表示されないこと、Web画面で保存したロールで `/talk` が使えること、Discordでロールを外すと60秒以内にWeb画面の権限からも外れること、ログアウト後に `/api/me` が401になること。
 
 ## 更新・バックアップ
 

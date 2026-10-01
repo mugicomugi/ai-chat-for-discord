@@ -4,6 +4,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
 COPY src ./src
 COPY migrations ./migrations
+# Compiled into the binary: the web UI's files and the privacy policy / terms pages.
+COPY static ./static
+COPY docs ./docs
 
 FROM source AS build
 # .cargo/config.toml keeps local Docker Desktop builds at one job; CI raises it.

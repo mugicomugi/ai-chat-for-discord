@@ -124,6 +124,8 @@
 
    > **M1 より前のイメージに戻すと、サーバーの許可リストとロールによる利用制限が効かなくなります。** Bot を追加しているサーバーの全員が `/talk` を使える状態に戻ります。DB の設定は残るので、M1 以降のイメージに戻せば再び有効になります。
 
+   > **M2 より前のイメージに戻すと、Web 管理画面は止まります**（Caddy は動き続け、502 を返します）。ログイン中のセッションは DB に残り、M2 以降のイメージに戻せばそのまま使えます。
+
 **M0 以前のイメージ（`docker compose up --build` でビルドしていた頃のもの）に戻す場合**は、`deploy.sh` が受け付けないタグなので、次のように戻します。
 
 ```bash
@@ -251,10 +253,10 @@ age -d -i discussion-backup-identity.txt discussion-XXXX.sql.zst.age | zstd -d \
 利用者から自分のデータの削除を依頼されたときの手順です（ナレッジ機能の段階で `/privacy` コマンドによるセルフサービスに置き換えます）。
 
 1. 依頼者の Discord ユーザー ID を確認する。
-2. 削除する（回答の投稿記録 `talk_replies` は外部キーで一緒に消えます）。
+2. 削除する（回答の投稿記録 `talk_replies` は外部キーで一緒に消えます。`web_sessions` は Web 管理画面のログイン情報で、消すとその人はログアウトします）。
 
    ```bash
-   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM talk_runs WHERE user_id = <USER_ID>"'
+   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM talk_runs WHERE user_id = <USER_ID>; DELETE FROM web_sessions WHERE user_id = <USER_ID>"'
    ```
 
 3. バックアップからの復元に備えて、台帳に記録する（root だけが読めるファイル）。
@@ -270,7 +272,7 @@ age -d -i discussion-backup-identity.txt discussion-XXXX.sql.zst.age | zstd -d \
 1. **Installation** → Install Link を **None** にする。
 2. **Bot** → **Public Bot** を OFF にする（Install Link が残っていると OFF にできません）。
 3. **Privileged Gateway Intents** → Message Content Intent は ON のまま。
-4. **General Information** で次の 2 つを登録する。Web 管理画面の公開後は `https://<ドメイン>/privacy` などに切り替えます。
+4. **General Information** で次の 2 つを登録する。Web 管理画面を公開した後は `https://<ドメイン>/privacy` と `https://<ドメイン>/terms` に切り替えます（「12. Web 管理画面を公開する」）。
    - Privacy Policy URL: `https://github.com/mugicomugi/ai-chat-for-discord/blob/main/docs/privacy.md`
    - Terms of Service URL: 同じ場所の `terms.md`
 
@@ -338,7 +340,7 @@ sudo bash -c 'set -euo pipefail; set -a; . ./.env; set +a
 
 ## 10. OCI での注意
 
-- **ポート**: Web 管理画面を公開するとき（M3）は、OCI のセキュリティリストで TCP 80/443 だけを開けます。
+- **ポート**: Web 管理画面を公開するとき（「12. Web 管理画面を公開する」）は、OCI のセキュリティリストで TCP 80/443 だけを開けます。
   - ホストの iptables の INPUT は変更しません。Docker が公開するポートは FORWARD を通るためです。
   - Docker が動いている間に `netfilter-persistent save` を実行しないでください。
   - 8080（Bot）と 3306（DB）は公開しません。
@@ -356,4 +358,60 @@ sudo bash -c 'set -euo pipefail; set -a; . ./.env; set +a
   - バックアップの鮮度（26 時間超）
   - TLS 証明書の期限（`DOMAIN` を設定した後）
 - 状態の確認: `systemctl list-timers 'discussion-bot-*'`、`journalctl -u discussion-bot-healthwatch -n 50`
-- Web 管理画面の公開後（M3）は、外部の死活監視サービスから `https://<ドメイン>/healthz` を監視します。
+- Bot コンテナには Docker のヘルスチェック（`/app/bot healthcheck`、30 秒ごと）があり、Web 管理画面を有効にしていると DB と Discord への接続を確かめます（無効なら常に healthy）。unhealthy になると healthwatch が通知します。
+- Web 管理画面の公開後は、外部の死活監視サービスから `https://<ドメイン>/healthz` を監視します（「12. Web 管理画面を公開する」）。
+
+## 12. Web 管理画面を公開する
+
+Discord でログインしてロールを設定できる画面（README の「Web管理画面」）を `https://<ドメイン>/` で公開します。Caddy が HTTPS の証明書（Let's Encrypt）を自動で取得・更新し、Bot の 8080 番へ中継します。Bot の 8080 番と DB はホストに公開しません。
+
+**メモリ**: Caddy の上限は 96MB です（Bot 256MB・DB 512MB と合わせて 1GB の VM に収まる見積もり）。公開後しばらくは `sudo docker stats --no-stream` と healthwatch の空きメモリの通知を確認してください。
+
+### 公開の手順（一度だけ）
+
+1. **ドメインと DNS**: ドメイン（例 `bot.example.com`）の A レコードを VM のパブリック IP に向ける。IPv6 で公開しない場合は AAAA レコードを作らない。`dig +short bot.example.com` で反映を確認する。
+2. **OCI のポート**: VCN のセキュリティリスト（または NSG）で、インバウンドの **TCP 80 と 443**（ソース `0.0.0.0/0`）を許可する。
+   - 80 は証明書の取得（HTTP-01）と HTTPS へのリダイレクトに使います。UDP 443（HTTP/3）は使いません。
+   - ホストの iptables は変更しません（「10. OCI での注意」）。
+3. **Developer Portal**（アプリの **OAuth2** 画面）
+   - **Redirects** に `https://<ドメイン>/auth/callback` を追加して保存する。
+   - **Client ID** を控え、**Client Secret** を発行（Reset Secret）して控える。
+4. **`.env`** に追加する（`chmod 600 .env` のままにする）。
+
+   ```dotenv
+   DISCORD_CLIENT_ID=<Client ID>
+   DISCORD_CLIENT_SECRET=<Client Secret>
+   PUBLIC_BASE_URL=https://<ドメイン>
+   DOMAIN=<ドメイン>
+   COMPOSE_PROFILES=web
+   ```
+
+   3 つの変数（`DISCORD_CLIENT_ID`・`DISCORD_CLIENT_SECRET`・`PUBLIC_BASE_URL`）の一部だけを設定すると、Bot は起動しません。
+
+5. **証明書の期限監視**: `sudoedit /etc/discussion-bot/ops.env` で `DOMAIN="<ドメイン>"` を設定する（healthwatch が証明書の期限を確認します）。
+6. **起動**: Bot を作り直し（新しい環境変数を読ませる）、Caddy を起動する。
+
+   ```bash
+   sudo scripts/deploy.sh "$(sed -n 's/^BOT_IMAGE=//p' .env)"
+   sudo docker compose up -d caddy
+   sudo docker compose logs --tail 50 caddy     # "certificate obtained successfully" を確認
+   ```
+
+   ログに `web_listening` が出ていれば、Bot は 8080 番で待ち受けています。
+
+7. **確認**
+   - `curl -sS https://<ドメイン>/healthz` が `ok` を返す。`curl -sI http://<ドメイン>/` が HTTPS へのリダイレクト（308）になる。
+   - ブラウザーで `https://<ドメイン>/` を開き、Discord でログインする。開発者ツールで、Cookie `__Host-session` が Secure・HttpOnly・SameSite=Lax であることと、コンソールに CSP の違反が出ていないことを確認する。
+   - サーバー管理権限のあるアカウントでロールを保存し、`/config show` に反映されること、権限のないアカウントでは設定画面が出ないことを確認する。Discord でロールを外すと、60 秒以内に Web 画面の権限からも外れる。
+   - `sudo docker compose ps` で bot が `healthy`、caddy が `running` であること。healthwatch は caddy も監視します。
+8. **外部からの監視**: UptimeRobot などの外部の死活監視サービスで `https://<ドメイン>/healthz` を 5 分ごとに監視し、200 以外で運営者に通知する設定にする（VM ごと止まった場合は healthwatch では通知できないため）。本文は `ok` / `unavailable` だけで、詳細は出しません。
+9. **Privacy Policy / Terms of Service の URL**: `docs/privacy.md` と `docs/terms.md` の `<…>` を埋めてコミットし、そのイメージをデプロイしてから、Developer Portal の **General Information** を `https://<ドメイン>/privacy` と `https://<ドメイン>/terms` に切り替える。2 つのページはイメージに組み込まれるので、文面の変更はイメージの再ビルドで反映されます。
+
+### 運用
+
+- **Caddyfile（`deploy/caddy/Caddyfile`）を変更したとき**: `sudo docker compose restart caddy`（管理 API を無効にしているので `caddy reload` は使えません）。
+- **Caddy の更新**: Dependabot が `compose.yaml` の digest を更新する PR を作ります。マージ後に `git pull --ff-only` と `sudo docker compose up -d caddy`。
+- **証明書**: `caddy_data` ボリュームに保存されます。消すと再取得になり、Let's Encrypt の発行回数の上限に当たることがあるので、`docker compose down -v` は使いません。
+- **Client Secret の交換**: Developer Portal で Reset Secret し、`.env` を書き換えて `sudo scripts/deploy.sh "$(sed -n 's/^BOT_IMAGE=//p' .env)"`。ログイン中のセッションはそのまま使えます。
+- **全員をログアウトさせる**: `sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM web_sessions"'`
+- **公開をやめる**: `.env` の 3 つの変数を空にして `COMPOSE_PROFILES` を消し、Bot を作り直す（上の deploy.sh）。続けて `sudo docker compose --profile web stop caddy` と `sudo docker compose --profile web rm -f caddy` で Caddy を止め、OCI のセキュリティリストから 80/443 を外す。

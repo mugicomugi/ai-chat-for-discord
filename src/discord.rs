@@ -15,16 +15,24 @@ use crate::{
     config::Config,
     db::{Database, NewRun, RoleChange},
     history::{self, Entry, History},
-    limits::{Busy, Limits},
+    limits::{Busy, Key, Limits},
     output::split_message,
+    web::{BotGuilds, authz::DiscordCache},
 };
 
 pub struct Handler {
     pub config: Arc<Config>,
     pub db: Database,
     pub agent: Agent,
-    pub limits: Limits,
+    /// Shared with the web chat.
+    pub limits: Arc<Limits>,
     pub registered: AtomicBool,
+    /// The guilds the bot is in; the web UI only offers these.
+    pub bot_guilds: BotGuilds,
+    /// Whether the gateway is connected (the web UI's /healthz).
+    pub discord_ready: Arc<AtomicBool>,
+    /// The web UI's cache of guild data, dropped when roles or the guild change.
+    pub discord_cache: Arc<DiscordCache>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -155,6 +163,10 @@ pub fn no_mentions() -> CreateAllowedMentions {
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
+        // A new session lists every guild the bot is in (as unavailable until GUILD_CREATE).
+        *self.bot_guilds.write().expect("bot guild lock poisoned") =
+            ready.guilds.iter().map(|guild| guild.id.get()).collect();
+        self.discord_ready.store(true, Ordering::Relaxed);
         if self.registered.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -198,6 +210,61 @@ impl EventHandler for Handler {
         }
     }
 
+    async fn shard_stage_update(&self, _ctx: Context, event: ShardStageUpdateEvent) {
+        self.discord_ready
+            .store(event.new == ConnectionStage::Connected, Ordering::Relaxed);
+    }
+
+    async fn resume(&self, _ctx: Context, _event: ResumedEvent) {
+        self.discord_ready.store(true, Ordering::Relaxed);
+    }
+
+    async fn guild_create(&self, _ctx: Context, guild: Guild, _is_new: Option<bool>) {
+        self.bot_guilds
+            .write()
+            .expect("bot guild lock poisoned")
+            .insert(guild.id.get());
+        self.discord_cache.forget_guild(guild.id.get());
+    }
+
+    async fn guild_delete(
+        &self,
+        _ctx: Context,
+        incomplete: UnavailableGuild,
+        _full: Option<Guild>,
+    ) {
+        // `unavailable` means a Discord outage, not that the bot was removed.
+        if !incomplete.unavailable {
+            self.bot_guilds
+                .write()
+                .expect("bot guild lock poisoned")
+                .remove(&incomplete.id.get());
+        }
+        self.discord_cache.forget_guild(incomplete.id.get());
+    }
+
+    async fn guild_update(
+        &self,
+        _ctx: Context,
+        _old_data_if_available: Option<Guild>,
+        new_data: PartialGuild,
+    ) {
+        self.discord_cache.forget_guild(new_data.id.get());
+    }
+
+    async fn guild_role_create(&self, _ctx: Context, new: Role) {
+        self.discord_cache.forget_guild(new.guild_id.get());
+    }
+
+    async fn guild_role_update(
+        &self,
+        _ctx: Context,
+        _old_data_if_available: Option<Role>,
+        new: Role,
+    ) {
+        self.discord_cache.forget_guild(new.guild_id.get());
+    }
+
     async fn guild_role_delete(
         &self,
         _ctx: Context,
@@ -205,6 +272,7 @@ impl EventHandler for Handler {
         removed_role_id: RoleId,
         _removed_role_data_if_available: Option<Role>,
     ) {
+        self.discord_cache.forget_guild(guild_id.get());
         match self
             .db
             .forget_role(guild_id.get(), removed_role_id.get())
@@ -270,10 +338,10 @@ impl Handler {
                 return;
             }
         };
-        let _lease = match self.limits.enter(command.channel_id.get()) {
+        let _lease = match self.limits.enter(Key::Channel(command.channel_id.get())) {
             Ok(lease) => lease,
             Err(busy) => {
-                let message = if busy == Busy::Channel {
+                let message = if busy == Busy::Key {
                     "このチャンネルでは回答を作成中です。完了後に再試行してください。"
                 } else {
                     "現在Botが混み合っています。少し待って再試行してください。"
@@ -569,7 +637,14 @@ impl Handler {
                     Err(_) => SETTINGS_SAVE_FAILED.to_owned(),
                 }
             }
-            ("show", _) => describe_settings(guild_id, &settings),
+            ("show", _) => {
+                let web = self
+                    .config
+                    .web
+                    .as_ref()
+                    .map(|web| web.public_origin.as_str());
+                describe_settings(guild_id, &settings, web)
+            }
             _ => return,
         };
         reject(ctx, command, &message).await;
@@ -663,7 +738,7 @@ fn timestamp(value: Timestamp) -> DateTime<Utc> {
         .expect("Discord timestamp is representable")
 }
 
-fn describe_settings(guild_id: u64, settings: &GuildAccess) -> String {
+fn describe_settings(guild_id: u64, settings: &GuildAccess, web: Option<&str>) -> String {
     let list = |roles: &[u64], empty: &str| {
         if roles.is_empty() {
             empty.to_owned()
@@ -675,7 +750,7 @@ fn describe_settings(guild_id: u64, settings: &GuildAccess) -> String {
                 .join("、")
         }
     };
-    format!(
+    let mut text = format!(
         "**このサーバーの設定**\n\
          利用ロール（/talk）: {}\n\
          ナレッジ管理ロール: {}\n\n\
@@ -688,7 +763,14 @@ fn describe_settings(guild_id: u64, settings: &GuildAccess) -> String {
             settings.roles(RoleKind::Manage),
             "未設定（サーバー管理権限を持つ人だけが管理できます）"
         ),
-    )
+    );
+    if let Some(origin) = web {
+        // Angle brackets keep Discord from adding a link preview.
+        text.push_str(&format!(
+            "\nWeb管理画面（Discordでログイン）でも設定できます: <{origin}/#/guilds/{guild_id}>"
+        ));
+    }
+    text
 }
 
 /// Replies only to the caller (rejections and settings), with mentions disabled.
@@ -740,6 +822,15 @@ mod tests {
             .collect();
         assert_eq!(choices, ["use", "manage"]);
         let mentions = serde_json::to_value(no_mentions()).unwrap();
+        let settings = GuildAccess {
+            allowed: true,
+            use_roles: vec![5],
+            manage_roles: vec![],
+        };
+        let text = describe_settings(7, &settings, None);
+        assert!(text.contains("<@&5>") && !text.contains("Web管理画面"));
+        let text = describe_settings(7, &settings, Some("https://bot.example"));
+        assert!(text.ends_with("<https://bot.example/#/guilds/7>"));
         assert_eq!(mentions["parse"], serde_json::json!([]));
         assert_eq!(mentions["replied_user"], false);
     }
