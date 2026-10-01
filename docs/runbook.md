@@ -126,6 +126,8 @@
 
    > **M2 より前のイメージに戻すと、Web 管理画面は止まります**（Caddy は動き続け、502 を返します）。ログイン中のセッションは DB に残り、M2 以降のイメージに戻せばそのまま使えます。Docker のヘルスチェックも M2 のイメージから入ったものなので、古いイメージでは `docker compose ps` に health が表示されません。
 
+   > **M3 より前のイメージに戻すと、ナレッジベースは使えなくなります**（`/talk` は資料なしで答え、Web 画面に「ナレッジ」タブが出ません）。資料・チャンク・ベクトルは DB に残り、M3 以降のイメージに戻せば取り込みの続きから再開します。
+
 **M0 以前のイメージ（`docker compose up --build` でビルドしていた頃のもの）に戻す場合**は、`deploy.sh` が受け付けないタグなので、次のように戻します。
 
 ```bash
@@ -231,6 +233,8 @@ sudo docker compose up -d --no-build --no-deps bot
 
 形式はすべて `mariadb-dump | zstd | age` です。VM の外の保管先にも 35 日で消える設定をし、プライバシーポリシーの「バックアップは最長 35 日」と一致させます。
 
+ナレッジベースのベクトル（`kb_embeddings.embedding`、VECTOR 型）は、`mariadb-dump --hex-blob` でなければ正しく書き出せません。`scripts/backup.sh` はこのオプションを使っており、CI（`scripts/check-vector-dump.sh`）が、書き出して別のスキーマに復元したベクトルが元と1バイトも違わないことを毎回確認しています。手作業でダンプするときも `--hex-blob` を付け、ベクトルの表に `SELECT … INTO OUTFILE` / `LOAD DATA` は使わないでください（MDEV-40853）。
+
 **復元の練習**は手元の PC で行います（VM で 2 つ目の DB を動かすとメモリが足りません）。
 
 ```bash
@@ -248,7 +252,7 @@ age -d -i discussion-backup-identity.txt discussion-XXXX.sql.zst.age | zstd -d \
 
 **復元した後は**、Bot を起動する前に次の 2 つを行います。
 
-1. 「6. 削除依頼への対応」の台帳にある削除を、もう一度すべて適用する。
+1. 「6. 削除依頼への対応」の台帳にある削除を、もう一度すべて適用する（`kb_document=<ID>` と書いた行は、その資料の削除も）。
 2. Web 管理画面のログインをすべて消す（バックアップの時点で有効だったセッションが復活し、その後にログアウトしたものや、漏えいのため全員をログアウトさせたものも再び使えてしまうため）。利用者はもう一度ログインすれば使えます。
 
    ```bash
@@ -257,19 +261,23 @@ age -d -i discussion-backup-identity.txt discussion-XXXX.sql.zst.age | zstd -d \
 
 ## 6. 削除依頼への対応
 
-利用者から自分のデータの削除を依頼されたときの手順です（ナレッジ機能の段階で `/privacy` コマンドによるセルフサービスに置き換えます）。
+利用者から自分のデータの削除を依頼されたときの手順です（M5「プライバシー・運用の仕上げ」で `/privacy` コマンドによるセルフサービスに置き換えます）。
 
 1. 依頼者の Discord ユーザー ID を確認する。
 2. 削除する（回答の投稿記録 `talk_replies` は外部キーで一緒に消えます。`web_sessions` は Web 管理画面のログイン情報で、消すとその人はログアウトします）。
 
    ```bash
-   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM talk_runs WHERE user_id = <USER_ID>; DELETE FROM web_sessions WHERE user_id = <USER_ID>"'
+   sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM talk_runs WHERE user_id = <USER_ID>; DELETE FROM web_sessions WHERE user_id = <USER_ID>; UPDATE kb_documents SET uploaded_by = NULL, uploaded_by_name = NULL WHERE uploaded_by = <USER_ID>"'
    ```
 
-3. バックアップからの復元に備えて、台帳に記録する（root だけが読めるファイル）。
+   ナレッジ資料はサーバーのもの（そのサーバーのナレッジ管理者が管理）なので、資料そのものは消さず、登録者の ID と名前だけを消します。資料の内容に依頼者の個人情報が含まれている場合は、そのサーバーのナレッジ管理者に資料の削除を依頼するか、運営者が `DELETE FROM kb_documents WHERE id = <ID>` で削除します（チャンクとベクトルも一緒に消えます）。
+
+3. バックアップからの復元に備えて、台帳に記録する（root だけが読めるファイル）。依頼のために運営者が資料を削除した場合は、その資料の ID も同じ行に書きます（復元すると資料も戻るため）。
 
    ```bash
    echo "$(date -u +%F) <USER_ID>" | sudo tee -a /etc/discussion-bot/erasures.log >/dev/null
+   # 資料も削除した場合
+   echo "$(date -u +%F) <USER_ID> kb_document=<ID>" | sudo tee -a /etc/discussion-bot/erasures.log >/dev/null
    ```
 
 4. 依頼者に完了を伝える。バックアップには最長 35 日残ることも伝える。
@@ -318,6 +326,7 @@ ops guild role list <GUILD_ID>               # 設定済みのロール
 ops guild role add <GUILD_ID> use <ROLE_ID>       # 利用ロールを追加
 ops guild role add <GUILD_ID> manage <ROLE_ID>    # ナレッジ管理ロールを追加
 ops guild role remove <GUILD_ID> use <ROLE_ID>    # 外す
+ops kb prune-embeddings [--apply]            # 今の設定にないモデルのベクトルを削除（「13-5」）
 ```
 
 - 種類ごとに最大 25 ロールです。Discord で削除したロールは自動で設定から外れます。
@@ -422,3 +431,94 @@ Discord でログインしてロールを設定できる画面（README の「We
 - **Client Secret の交換**: Developer Portal で Reset Secret し、`.env` を書き換えて `sudo scripts/deploy.sh "$(sed -n 's/^BOT_IMAGE=//p' .env)"`。ログイン中のセッションはそのまま使えます。
 - **全員をログアウトさせる**: `sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM web_sessions"'`
 - **公開をやめる**: `.env` の 3 つの変数を空にして `COMPOSE_PROFILES` を消し、Bot を作り直す（上の deploy.sh）。続けて `sudo docker compose --profile web stop caddy` と `sudo docker compose --profile web rm -f caddy` で Caddy を止め、OCI のセキュリティリストから 80/443 を外す。最後に `sudoedit /etc/discussion-bot/ops.env` で `DOMAIN=""` にする（残っていると、healthwatch が証明書を確認できないという通知を 6 時間ごとに送り続けます）。
+
+## 13. ナレッジベース
+
+サーバーごとの資料を `/talk` が参照する機能です（README の「ナレッジベース」）。資料は Web 管理画面からだけ登録するので、先に「12. Web 管理画面を公開する」を済ませておきます。`EMBEDDING_PROVIDERS` が空の間は無効です。
+
+### 13-1. Ollama の埋め込みが使えるかの確認（一度だけ）
+
+既存の `OLLAMA_API_KEY` で `https://ollama.com/api/embed` が使えるかを、固定の公開テキストだけを送って確かめます（利用枠をわずかに使います）。
+
+```bash
+scripts/cargo-vm.sh test --locked --test live_embed live_ollama_embed -- --ignored --nocapture
+```
+
+初回はテスト用のビルドに時間がかかります（利用の少ない時間に実行してください）。`Ollama: WORKS with <モデル>: 768 dimensions …` と出れば使えます。モデルは `.env` の `OLLAMA_EMBEDDING_MODEL`（なければ `embeddinggemma`）です。`DOES NOT WORK` の場合は、表示された種類（`embedding_auth`: キーが拒否された、`embedding_upstream`: モデルがない・サーバーエラー、`embedding_invalid`: 768 次元で返らない など）を控えます。
+
+**結果の記録**（実行したら書き換える）:
+
+| 実行日 | モデル | 結果 |
+| --- | --- | --- |
+| （未実行） | | |
+
+使えない場合は Gemini（主）と OpenAI（予備）を使います（`EMBEDDING_PROVIDERS=gemini,openai`）。
+
+### 13-2. キーの準備
+
+- **Gemini**: Google AI Studio（<https://aistudio.google.com/apikey>）で API キーを作ります。**本番では課金を有効にしたプロジェクト（有料枠）のキーを使います**。無料枠では送信した内容が Google のサービス改善に使われることがあるため、無料枠で試すときは公開しても問題のないテスト用の資料だけを使ってください。
+- **OpenAI**: <https://platform.openai.com/api-keys> で API キーを作り、組織の設定（Limits）で**月額の利用上限（budget）**を設定します。権限を絞ったキー（Restricted）にする場合は、`/v1/embeddings` を呼べる権限だけを付けます。
+- 確認（キーのあるプロバイダーだけ実行されます）:
+
+  ```bash
+  scripts/cargo-vm.sh test --locked --test live_embed -- --ignored --nocapture
+  ```
+
+### 13-3. 有効にする
+
+1. `.env` に追加する（`chmod 600 .env` のまま）。
+
+   ```dotenv
+   EMBEDDING_PROVIDERS=gemini,openai
+   GEMINI_API_KEY=<キー>
+   OPENAI_API_KEY=<キー>
+   ```
+
+   - 並べた順が優先順です。取り込みも検索も先頭から使い、使えないものは飛ばします。
+   - 並べたプロバイダーのキーがないと Bot は起動しません（`deploy.sh` が `discord_ready` を待ってタイムアウトします）。
+2. Bot を作り直す: `sudo scripts/deploy.sh "$(sed -n 's/^BOT_IMAGE=//p' .env)"`。ログに `knowledge_worker_started` が出れば動いています。
+3. `KB_MAX_UPLOAD_BYTES` を変えたときは Caddy も作り直す（受信上限が同じ値になります）: `sudo docker compose up -d caddy`。
+4. 各サーバーの管理者に、Web 管理画面の「ロール設定」で「ナレッジ管理ロール」を必要に応じて設定してもらいます（サーバー管理権限を持つ人は設定なしで管理できます）。
+5. 確認: Web 管理画面の「ナレッジ」タブで小さな資料を登録し、「利用できます」になったら `/talk message:<資料の内容についての質問> knowledge:true` で、回答の末尾に「参照したナレッジ資料:」が出ることを確かめます。PDF を登録している間に `sudo docker stats --no-stream` で Bot のメモリを確認します（PDF は Bot と同じコンテナの別プロセスで処理されます）。256MB に近づくようなら `KB_MAX_UPLOAD_BYTES` を下げるか、`compose.yaml` の Bot の `mem_limit` を 320m に上げます。
+
+### 13-4. 送信ペースとレート制限
+
+取り込み（バックグラウンド）は、プロバイダーごとに `<P>_EMBEDDING_REQUESTS_PER_MINUTE`・`<P>_EMBEDDING_TOKENS_PER_MINUTE`・`<P>_EMBEDDING_REQUESTS_PER_DAY`（`<P>` は `GEMINI`・`OPENAI`・`OLLAMA`）を超えないように送ります。既定値と考え方は README の「送信ペース」にあります。
+
+- **Gemini の既定値は無料枠向け**です（1分50件・20,000トークン、1日800件。1日に約800チャンクしか進みません）。有料枠に切り替えたら、Google AI Studio のプロジェクトの上限を見て引き上げます（例 `GEMINI_EMBEDDING_REQUESTS_PER_MINUTE=1000`、`GEMINI_EMBEDDING_TOKENS_PER_MINUTE=500000`、`GEMINI_EMBEDDING_REQUESTS_PER_DAY=0`）。変更は Bot の作り直しで反映されます。
+- 1日の件数の上限は取り込みだけに効き、`/talk` の質問のベクトル化（1回1件）はその残りを使います。Bot を再起動すると数え直しになりますが、そのときはプロバイダーの 429 で止まります。
+- レート制限（429・1日の上限・利用枠の不足）は資料の失敗に数えません。Web 画面のプロバイダー欄に「レート制限のため HH:MM ごろまで待機」と表示され、時間が来ると自動で再開します（最長でも1時間ごとに様子を見ます）。
+- ログ（本文・キーは出しません）:
+  - `embedding_rate_limited`（`provider`, `wait_seconds`）: 429 などで一時停止した。
+  - `embedding_auth_failed`: キーが拒否された（そのプロバイダーを10分止める）。キーと課金設定を確認します。
+  - `embedding_request_failed`（`error_code`）: 一時的なエラー。同じ資料で5回続くと `kb_document_failed` になります（ほかのプロバイダーがレート制限・1日の上限で待っている間のエラーは数えず、資料はそのプロバイダーを待ちます）。
+  - `knowledge_query_provider_skipped` / `knowledge_query_timeout` / `knowledge_search_failed`: `/talk` の検索で使えないプロバイダーがあった・検索できなかった。
+  - `kb_upload_busy`: 同時に受け付けられる2件の登録が処理中で、資料の登録を断った。続くようなら登録の多い時間を避けてもらいます。
+  - `pdf_extractor_failed`（`exit_code`, `signal`）: PDF を読む子プロセスが異常終了した。`signal` が出ているときはメモリ不足で止められた可能性が高いので、`sudo docker stats --no-stream` で Bot のメモリを確認します。
+
+### 13-5. モデルを変えたとき（古いベクトルの削除）
+
+ベクトルには「プロバイダー:モデル」が付いていて、異なるモデルのものは比較しません。`GEMINI_EMBEDDING_MODEL` などを変えると、新しいモデルのベクトルが補完で作られます（送信ペースに従うので時間がかかります）。その間、検索はすべての資料のベクトルがそろっているプロバイダー（`EMBEDDING_PROVIDERS` のほかのプロバイダー）を使い、そろったプロバイダーがないときだけ、新しいモデルのベクトルがある資料を対象にします。古いモデルのベクトルは検索に使わず、削除するまでそのまま残ります。
+
+補完が終わったら（Web 画面で、すべての資料の新しいモデルの進み具合が全チャンクになったら）、古いベクトルを消します。
+
+`ops` は「8. サーバー（ギルド）を追加する」で定義したシェル関数（`sudo docker compose exec bot /app/bot ops …`）です。
+
+```bash
+ops kb prune-embeddings             # 確認だけ（何件消えるかを表示し、何もしない）
+ops kb prune-embeddings --apply     # 今の EMBEDDING_PROVIDERS にないキーのベクトルを削除
+```
+
+`EMBEDDING_PROVIDERS` が空のときは、すべてが「古い」と判定されてしまうため実行を拒否します。設定ミスで消えないよう、自動では削除しません。
+
+### 13-6. Bot がサーバーから外されたとき
+
+自動で資料を消す仕組みは M5 で追加します。それまでは、サーバーから外された（再び招待されない）ことを確かめてから、そのサーバーの資料を運営者が削除します（チャンクとベクトルも一緒に消えます。バックアップには最長 35 日残ります）。
+
+```bash
+sudo docker compose exec db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot "$MARIADB_DATABASE" -e "DELETE FROM kb_documents WHERE guild_id = <GUILD_ID>"'
+```
+
+### 13-7. 容量の上限
+
+`KB_MAX_DOCS_PER_GUILD`（50件）・`KB_MAX_CHUNKS_PER_GUILD`（5,000チャンク）・`KB_MAX_CHUNKS_TOTAL`（Bot 全体で30,000チャンク）は登録の時点で確認します。検索は1回にそのサーバーの全ベクトルと比べる（ベクトル索引なし）ので、5,000チャンクで1回約15MBを読みます。DB のメモリ（512MB）に余裕がない場合は上限を下げます。上限を下げても登録済みの資料は消えません。

@@ -47,6 +47,27 @@ export async function api(method, path, body) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(body);
   }
+  return request(path, init);
+}
+
+/**
+ * Uploads a file as the raw request body. Its name goes percent-encoded in X-File-Name, a custom
+ * header that cross-site forms cannot send.
+ */
+export async function uploadFile(path, file) {
+  return request(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/octet-stream",
+      "X-File-Name": encodeURIComponent(file.name),
+    },
+    body: file,
+  });
+}
+
+async function request(path, init) {
   let response;
   try {
     response = await fetch(path, init);
@@ -90,6 +111,13 @@ async function loadMe(refresh) {
 /** Pages of a server, shown to users holding the right that `visible` checks. */
 export const guildTabs = [
   { id: "roles", label: "ロール設定", visible: (rights) => rights.configure, render: rolesTab },
+  {
+    id: "knowledge",
+    label: "ナレッジ",
+    // Only while the knowledge base is enabled on the server (`knowledge` in /api/me).
+    visible: (rights) => rights.manage_kb && session.me?.knowledge === true,
+    render: knowledgeTab,
+  },
 ];
 
 const GUILD_PATH = /^\/guilds\/(\d{1,20})(?:\/([a-z-]+))?$/;
@@ -312,7 +340,7 @@ const ROLE_KINDS = [
   {
     key: "manage",
     title: "ナレッジ管理ロール",
-    help: "選んだロールを持つ人が、今後追加するナレッジ（資料）を管理できます。サーバー管理権限を持つ人は、選ばなくても管理できます。",
+    help: "選んだロールを持つ人が、このサーバーのナレッジ（/talk が参照する資料）を Web 画面で登録・削除できます。サーバー管理権限を持つ人は、選ばなくても管理できます。",
   },
 ];
 
@@ -432,6 +460,314 @@ function roleGroup(kind, data, known) {
     h("ul", { class: "role-list" }, items),
   );
   return { element, selected, update };
+}
+
+// ---- Knowledge base (M3) ----
+
+const STATUS_LABELS = {
+  processing: ["処理中", "warn"],
+  ready: ["利用できます", "ok"],
+  failed: ["失敗", "error"],
+};
+const KIND_LABELS = { text: "テキスト", markdown: "Markdown", pdf: "PDF" };
+const POLL_MS = 5000;
+
+// 1024-based, labelled as the server's messages are (KiB, MiB).
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function formatNumber(value) {
+  return Number(value).toLocaleString("ja-JP");
+}
+
+function formatTime(iso) {
+  const date = new Date(iso);
+  const sameDay = date.toDateString() === new Date().toDateString();
+  return sameDay
+    ? date.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function providerState(provider) {
+  const until = provider.until ? formatTime(provider.until) : "";
+  switch (provider.state) {
+    case "rate_limited":
+      return [`レート制限のため ${until} ごろまで待機しています（自動で再開します）`, "warn"];
+    case "auth_error":
+      return [`API キーが受け付けられませんでした。${until} ごろに再試行します。管理者に設定の確認を依頼してください`, "error"];
+    case "daily_limit":
+      return [`1日の送信量（設定値）に達したため ${until} ごろまで待機しています`, "warn"];
+    default:
+      return ["利用できます", "ok"];
+  }
+}
+
+async function knowledgeTab(guild) {
+  return knowledgeView(guild, await api("GET", `/api/guilds/${guild.id}/kb/documents`));
+}
+
+function knowledgeView(guild, initial) {
+  const base = `/api/guilds/${guild.id}/kb/documents`;
+  let data = initial;
+  let timer = null;
+  // Each navigation renders anew; a newer render means this view was left.
+  const generation = rendering;
+  const status = h("p", { class: "status", role: "status" });
+  const usage = h("p", { class: "muted" });
+  const providers = h("ul", { class: "providers" });
+  const tbody = h("tbody");
+  const empty = h("p", { class: "empty" }, "まだ資料が登録されていません。");
+  const tableWrap = h(
+    "div",
+    { class: "table-wrap" },
+    h(
+      "table",
+      { class: "documents" },
+      h(
+        "thead",
+        {},
+        h("tr", {}, h("th", {}, "資料"), h("th", {}, "状態"), h("th", {}, "進み具合"), h("th", {}, "登録"), h("th", {}, "操作")),
+      ),
+      tbody,
+    ),
+  );
+  const preview = h("section", { class: "preview", hidden: true, "aria-live": "polite" });
+  const input = h("input", { type: "file", "aria-label": "登録するファイル" });
+  const submit = h("button", { type: "submit", class: "primary" }, "アップロード");
+  const limitsNote = h("p", { class: "muted" });
+
+  const show = (message, kind = "") => {
+    status.className = kind ? `status ${kind}` : "status";
+    status.textContent = message ?? "";
+  };
+
+  const fail = (error) => {
+    if (error.status === 401) {
+      render();
+      return;
+    }
+    show(error instanceof ApiError ? error.message : "予期しないエラーが発生しました。", "error");
+  };
+
+  const reload = async () => {
+    try {
+      update(await api("GET", base));
+    } catch (error) {
+      fail(error);
+    }
+  };
+
+  // Polls every 5 seconds while a document is processing, until the tab is left.
+  const schedule = () => {
+    clearTimeout(timer);
+    if (!data.documents.some((document) => document.status === "processing")) return;
+    timer = setTimeout(async () => {
+      if (generation !== rendering || !element.isConnected) return;
+      await reload();
+    }, POLL_MS);
+  };
+
+  const form = h(
+    "form",
+    {
+      class: "upload",
+      onsubmit: async (event) => {
+        event.preventDefault();
+        const file = input.files?.[0];
+        if (!file) {
+          show("ファイルを選んでください。", "error");
+          return;
+        }
+        const name = file.name.toLowerCase();
+        if (!data.limits.extensions.some((extension) => name.endsWith(extension))) {
+          show(`登録できるのは ${data.limits.extensions.join("、")} のファイルだけです。`, "error");
+          return;
+        }
+        if (file.size === 0) {
+          show("ファイルが空です。", "error");
+          return;
+        }
+        if (file.size > data.limits.max_upload_bytes) {
+          show(`ファイルは ${formatBytes(data.limits.max_upload_bytes)} までです（このファイルは ${formatBytes(file.size)}）。`, "error");
+          return;
+        }
+        if (name.endsWith(".pdf") && file.size > data.limits.max_pdf_bytes) {
+          show(`PDF は ${formatBytes(data.limits.max_pdf_bytes)} までです（このファイルは ${formatBytes(file.size)}）。ファイルを分割してください。`, "error");
+          return;
+        }
+        submit.disabled = true;
+        show(name.endsWith(".pdf") ? "アップロードして本文を取り出しています（PDF は時間がかかります）…" : "アップロードしています…");
+        try {
+          const document = await uploadFile(base, file);
+          form.reset();
+          show(`「${document.title}」を登録しました。バックグラウンドで処理しています。`, "ok");
+          await reload();
+        } catch (error) {
+          fail(error);
+        } finally {
+          submit.disabled = false;
+        }
+      },
+    },
+    h("label", { class: "file" }, input),
+    submit,
+  );
+
+  const action = (label, handler, kind) =>
+    h(
+      "button",
+      {
+        type: "button",
+        class: kind ? `small ${kind}` : "small",
+        onclick: async (event) => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          try {
+            await handler();
+          } catch (error) {
+            fail(error);
+          } finally {
+            button.disabled = false;
+          }
+        },
+      },
+      label,
+    );
+
+  const showPreview = async (document) => {
+    const result = await api("GET", `${base}/${document.id}/preview`);
+    preview.replaceChildren(
+      h("h2", {}, `プレビュー: ${result.title}`),
+      h(
+        "p",
+        { class: "muted" },
+        result.truncated
+          ? `取り出した本文の先頭 ${formatNumber([...result.text].length)} 文字です（全体は ${formatNumber(result.char_count)} 文字）。文字化けしていないか確認してください。`
+          : "取り出した本文の全体です。文字化けしていないか確認してください。",
+      ),
+      h("pre", {}, result.text),
+      h("button", { type: "button", onclick: () => (preview.hidden = true) }, "閉じる"),
+    );
+    preview.hidden = false;
+    preview.scrollIntoView({ block: "nearest" });
+  };
+
+  const row = (document) => {
+    const [label, kind] = STATUS_LABELS[document.status] ?? [document.status, "off"];
+    const progress = document.progress.map((item) =>
+      h(
+        "div",
+        { class: "progress" },
+        h("span", {}, `${item.provider}: ${formatNumber(item.embedded)} / ${formatNumber(document.chunk_count)}`),
+        h("progress", { max: Math.max(document.chunk_count, 1), value: item.embedded }),
+      ),
+    );
+    const actions = [action("プレビュー", () => showPreview(document))];
+    if (document.status === "failed") {
+      actions.push(
+        action("再試行", async () => {
+          await api("POST", `${base}/${document.id}/retry`);
+          show(`「${document.title}」を再試行します。`, "ok");
+          await reload();
+        }),
+      );
+    }
+    actions.push(
+      action(
+        "削除",
+        async () => {
+          if (!confirm(`「${document.title}」を削除しますか？ 取り出した本文と検索用のデータもすべて削除され、元に戻せません。`)) return;
+          await api("DELETE", `${base}/${document.id}`);
+          preview.hidden = true;
+          show(`「${document.title}」を削除しました。`, "ok");
+          await reload();
+        },
+        "danger",
+      ),
+    );
+    return h(
+      "tr",
+      {},
+      h(
+        "td",
+        {},
+        h("div", { class: "doc-title" }, document.title),
+        h(
+          "div",
+          { class: "muted" },
+          `${document.file_name} · ${KIND_LABELS[document.kind] ?? document.kind} · ${formatBytes(document.byte_size)} · ${formatNumber(document.char_count)}文字 · ${formatNumber(document.chunk_count)}チャンク`,
+        ),
+      ),
+      h("td", {}, badge(label, kind), document.error && h("div", { class: `note ${document.status === "failed" ? "error" : "warn"}` }, document.error)),
+      h("td", {}, progress),
+      h("td", {}, h("div", {}, document.uploaded_by ?? "（不明）"), h("div", { class: "muted" }, formatTime(document.created_at))),
+      h("td", { class: "row-actions" }, actions),
+    );
+  };
+
+  const update = (next) => {
+    data = next;
+    const u = data.usage;
+    usage.textContent = `資料 ${formatNumber(u.documents)} / ${formatNumber(u.max_documents)} 件 · チャンク ${formatNumber(u.chunks)} / ${formatNumber(u.max_chunks)}（Bot 全体 ${formatNumber(u.total_chunks)} / ${formatNumber(u.max_total_chunks)}）`;
+    const limits = data.limits;
+    const pdf = limits.extensions.includes(".pdf")
+      ? `PDF は ${formatBytes(limits.max_pdf_bytes)}・${formatNumber(limits.max_pdf_pages)} ページまで、画像だけの PDF は不可。`
+      : "";
+    limitsNote.textContent = `登録できるファイル: ${limits.extensions.join("、")}（${formatBytes(limits.max_upload_bytes)}・本文 ${formatNumber(limits.max_text_chars)} 文字まで。${pdf}）`;
+    input.setAttribute("accept", data.limits.extensions.join(","));
+    providers.replaceChildren(
+      ...data.providers.map((provider, index) => {
+        const [text, kind] = providerState(provider);
+        return h(
+          "li",
+          {},
+          h("span", { class: "provider-name" }, `${index + 1}. ${provider.label}`),
+          " ",
+          badge(text, kind),
+        );
+      }),
+    );
+    tbody.replaceChildren(...data.documents.map(row));
+    empty.hidden = data.documents.length > 0;
+    tableWrap.hidden = data.documents.length === 0;
+    schedule();
+  };
+
+  const element = h(
+    "div",
+    { class: "knowledge" },
+    h(
+      "p",
+      { class: "status warn" },
+      "登録した資料の内容は、このサーバーで /talk を使う人への回答に引用されることがあり、回答はチャンネルに公開されます。個人情報や外部に出せない情報を含む資料は登録しないでください。",
+    ),
+    h(
+      "p",
+      { class: "muted" },
+      "資料は /talk の回答の参考にされ、使われた資料の名前が回答の末尾に表示されます。/talk の knowledge オプションを false にすると参照しません。",
+    ),
+    h("h2", {}, "資料を登録する"),
+    form,
+    limitsNote,
+    status,
+    h("h2", {}, "登録済みの資料"),
+    usage,
+    h("h3", {}, "埋め込みプロバイダー（上から順に使用）"),
+    providers,
+    h(
+      "p",
+      { class: "muted" },
+      "登録した資料は、プロバイダーの送信量の上限に合わせて少しずつ処理されます。無料枠のプロバイダーでは、大きな資料に数時間から数日かかることがあります。いずれかのプロバイダーで全チャンクの処理が終わると「利用できます」になり、/talk で参照されます。",
+    ),
+    empty,
+    tableWrap,
+    preview,
+  );
+  update(initial);
+  return element;
 }
 
 window.addEventListener("hashchange", () => render());

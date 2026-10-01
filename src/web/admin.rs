@@ -24,6 +24,9 @@ use crate::{
 pub struct Me {
     user: User,
     guilds: Vec<GuildRights>,
+    /// Present (true) only while the knowledge base is enabled; the UI shows its pages then.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    knowledge: bool,
 }
 
 #[derive(Serialize)]
@@ -100,6 +103,7 @@ pub async fn me(State(state): State<AppState>, session: Session) -> Result<Json<
             name: session.user_name,
         },
         guilds: guilds.into_iter().map(|(_, guild)| guild).collect(),
+        knowledge: state.knowledge.is_some(),
     }))
 }
 

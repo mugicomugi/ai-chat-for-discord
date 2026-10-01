@@ -43,6 +43,9 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Unit and mock-API tests
         run: cargo test --locked
+      # The documented fallback for hosts that cannot build the PDF parser (scripts/build-image.sh --no-pdf).
+      - name: Tests without PDF support
+        run: cargo test --locked --no-default-features
       # Same disposable database and server flags as local runs (compose.test.yaml). The two
       # database tests share state and must run in order with a server restart between them.
       - name: Start test database
@@ -69,6 +72,54 @@ jobs:
         run: cargo test --locked --test web web_login_keeps_only_allowlisted_guilds -- --ignored --exact
       - name: Web role settings test
         run: cargo test --locked --test web web_role_settings -- --ignored --exact
+      - name: Knowledge vector search test
+        run: cargo test --locked --test knowledge knowledge_vectors -- --ignored --exact
+      - name: Knowledge quota test
+        run: cargo test --locked --test knowledge knowledge_quotas -- --ignored --exact
+      - name: Knowledge ingestion test
+        run: cargo test --locked --test knowledge knowledge_ingest -- --ignored --exact
+      - name: Knowledge worker failover and backfill test
+        run: cargo test --locked --test knowledge knowledge_worker_failover_and_backfill -- --ignored --exact
+      - name: Knowledge worker restart and rate limit test
+        run: cargo test --locked --test knowledge knowledge_worker_restart_and_rate_limits -- --ignored --exact
+      - name: Knowledge worker failure and deletion test
+        run: cargo test --locked --test knowledge knowledge_worker_failures_and_deletion -- --ignored --exact
+      - name: Knowledge search provider choice test
+        run: cargo test --locked --test knowledge knowledge_search_prefers_complete_providers -- --ignored --exact
+      - name: Knowledge worker retry after rejection test
+        run: cargo test --locked --test knowledge knowledge_worker_retries_a_rejected_document -- --ignored --exact
+      - name: Knowledge worker rate-limited provider test
+        run: cargo test --locked --test knowledge knowledge_worker_waits_for_a_rate_limited_provider -- --ignored --exact
+      - name: Knowledge worker guild turns test
+        run: cargo test --locked --test knowledge knowledge_worker_lets_guilds_take_turns -- --ignored --exact
+      - name: Knowledge vector pruning test
+        run: cargo test --locked --test knowledge knowledge_prune_embeddings -- --ignored --exact
+      - name: Knowledge web API test
+        run: cargo test --locked --test web knowledge_web_api -- --ignored --exact
+      # Uses the vectors knowledge_vectors leaves behind; backups depend on this (scripts/backup.sh).
+      - name: VECTOR backup round trip (mariadb-dump --hex-blob)
+        run: scripts/check-vector-dump.sh
+
+  # The production VM (1 GB) compiles the image itself with one job: report the peak memory of
+  # such a build, so new dependencies (pdf-extract and lopdf in M3) can be judged before merging.
+  build-memory:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Release build with one job
+        run: |
+          /usr/bin/time -v cargo build --locked --release -j1 2> build-time.log || { cat build-time.log; exit 1; }
+          # The largest single compiler process, as on the VM.
+          peak=$(sed -n 's/^[[:space:]]*Maximum resident set size (kbytes): //p' build-time.log)
+          echo "Peak memory of one rustc process: $((peak / 1024)) MB" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Pull requests (including Dependabot base-image bumps) build the runtime image without pushing.
   docker-build:

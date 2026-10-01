@@ -10,6 +10,7 @@ use discord_discussion_bot::{
     config::Config,
     db::{Database, migrate_error_summary},
     discord::{self, Handler},
+    knowledge::{self, Knowledge, worker::Timing},
     limits::Limits,
     ops,
     web::{self, BotGuilds, authz::DiscordCache},
@@ -18,12 +19,18 @@ use serenity::all::{Client, GatewayIntents};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
-/// Web requests, the maintenance task and the gateway get this long to stop together.
+/// Web requests, the knowledge worker, the maintenance task and the gateway get this long to
+/// stop together.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
 fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The PDF parser's child process (knowledge::extract): stdout carries only the text, so
+    // nothing else (logging, .env) is set up.
+    if args.first().map(String::as_str) == Some("extract-pdf") {
+        std::process::exit(knowledge::extract::pdf_child());
+    }
+    dotenvy::dotenv().ok();
     // Docker runs the health check every 30 seconds: no runtime and no logging for it.
     if args.first().map(String::as_str) == Some("healthcheck") {
         std::process::exit(web::healthcheck());
@@ -75,6 +82,18 @@ async fn run() -> Result<()> {
     )
     .context("HTTP client initialization failed")?;
     let limits = Arc::new(Limits::new(4));
+    let knowledge = match config.kb.clone() {
+        Some(kb) => {
+            if config.web.is_none() {
+                // Documents are only uploaded on the web UI; existing ones stay searchable.
+                tracing::warn!("knowledge_base_without_web_ui");
+            }
+            Some(Arc::new(
+                Knowledge::new(kb, db.clone()).context("HTTP client initialization failed")?,
+            ))
+        }
+        None => None,
+    };
     let bot_guilds = BotGuilds::default();
     let discord_cache = Arc::new(DiscordCache::default());
     let handler = Handler {
@@ -85,6 +104,7 @@ async fn run() -> Result<()> {
         registered: AtomicBool::new(false),
         bot_guilds: bot_guilds.clone(),
         discord_cache: discord_cache.clone(),
+        knowledge: knowledge.clone(),
     };
     let mut client = Client::builder(
         &config.discord_token,
@@ -112,6 +132,7 @@ async fn run() -> Result<()> {
                 bot_guilds,
                 discord_ready: discord_ready.clone(),
                 discord_cache,
+                knowledge: knowledge.clone(),
             },
         )
         .context("HTTP client initialization failed")?;
@@ -123,6 +144,9 @@ async fn run() -> Result<()> {
         tracing::info!(bind = %web_config.bind, "web_listening");
         web_server = Some(tokio::spawn(web::serve(listener, state, stopped.clone())));
     }
+    let worker = knowledge
+        .as_ref()
+        .map(|knowledge| knowledge.spawn_worker(Timing::default(), stopped.clone()));
     let maintenance = tokio::spawn(maintenance(db, config.retention_days, stopped));
     let manager = client.shard_manager.clone();
     let result = tokio::select! {
@@ -143,6 +167,9 @@ async fn run() -> Result<()> {
         tokio::join!(manager.shutdown_all(), async {
             if let Some(server) = web_server {
                 let _ = server.await;
+            }
+            if let Some(worker) = worker {
+                let _ = worker.await;
             }
             let _ = maintenance.await;
         })

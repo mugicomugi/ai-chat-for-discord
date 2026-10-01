@@ -11,6 +11,7 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 /talk message:最新情報も調べて比較して web_search:true history:2h
 /talk message:この設計を評価して history:0m
 /talk message:今週の議論をまとめて history:7d
+/talk message:社内手順書に沿って答えて knowledge:true
 ```
 
 | オプション | デフォルト | 内容 |
@@ -18,6 +19,7 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 | `message` | 必須 | 質問本文。1〜4000文字 |
 | `web_search` | `false` | `true` の呼び出しだけWeb検索・ページ取得を許可 |
 | `history` | `15m` | `30m`、`2h`、`3d` など整数の分・時間・日。最大7日（`7d` / `168h` / `10080m`）で、その中の直近100件まで。`0m` / `0h` / `0d` で履歴なし |
+| `knowledge` | 資料があれば参照 | このサーバーの[ナレッジベース](#ナレッジベース)の資料を参照するか。`false` で参照しません。`true` で参照できる資料がないときは、その旨を回答に付記します |
 
 オプションは毎回独立しています。前の呼び出しの設定は引き継ぎません。通常のテキストチャンネル・既存スレッド・フォーラム投稿内で利用できます。回答は公開されます。DM、画像・添付ファイル解析、メンションによる呼び出しは実装していません。
 
@@ -36,7 +38,7 @@ Rust製のDiscord議論Botです。`/talk` で質問し、同じチャンネル�
 ```
 
 - `/config show` は、Web管理画面を有効にしている場合、そのサーバーの設定画面のURLも表示します。
-- 「ナレッジ管理」ロールは、今後追加するナレッジベースの資料を管理できるロールです（[docs/roadmap.md](docs/roadmap.md)）。ロールの設定を変更できるのは、サーバーのオーナーと「管理者」「サーバー管理」権限を持つ人だけです。
+- 「ナレッジ管理」ロールは、[ナレッジベース](#ナレッジベース)の資料を Web 管理画面で登録・削除できるロールです（サーバー管理権限を持つ人は設定しなくても管理できます）。ロールの設定を変更できるのは、サーバーのオーナーと「管理者」「サーバー管理」権限を持つ人だけです。
 - Discordで削除したロールは、設定からも自動で外れます。
 - 利用できない人が `/talk` を実行すると、理由が本人にだけ表示されます。履歴の取得・DBへの保存・AIの呼び出しは行いません。
 - Discordのサーバー設定の連携サービス（Integrations）でコマンド権限を設定すると、`/talk` を表示する相手をさらに絞れます。
@@ -108,7 +110,7 @@ docker compose up -d
 
 ## Web管理画面
 
-Discordアカウントでログインして、Botを導入しているサーバーでの自分の権限を確認し、サーバー管理者は利用ロール・ナレッジ管理ロールを設定できる画面です（今後ナレッジ管理とWebチャットを追加します。[docs/roadmap.md](docs/roadmap.md)）。BotとMariaDBに加えてCaddy（HTTPS）を動かし、`https://<ドメイン>/` で公開します。**任意の機能**で、下の3つの環境変数を設定しなければ起動せず、Botはこれまでどおり動きます。本番での公開手順（DNS、OCIのポート、Caddy、監視）は [docs/runbook.md](docs/runbook.md) の「12. Web 管理画面を公開する」を参照してください。
+Discordアカウントでログインして、Botを導入しているサーバーでの自分の権限を確認し、サーバー管理者は利用ロール・ナレッジ管理ロールを、ナレッジ管理ロールを持つ人は[ナレッジベース](#ナレッジベース)の資料を管理できる画面です（Webチャットは今後追加します。[docs/roadmap.md](docs/roadmap.md)）。BotとMariaDBに加えてCaddy（HTTPS）を動かし、`https://<ドメイン>/` で公開します。**任意の機能**で、下の3つの環境変数を設定しなければ起動せず、Botはこれまでどおり動きます。本番での公開手順（DNS、OCIのポート、Caddy、監視）は [docs/runbook.md](docs/runbook.md) の「12. Web 管理画面を公開する」を参照してください。
 
 ### 設定
 
@@ -152,6 +154,64 @@ Discordアカウントでログインして、Botを導入しているサーバ�
 
 Developer Portal の Redirects に `http://localhost:8080/auth/callback` も追加し、`.env` で `PUBLIC_BASE_URL=http://localhost:8080` と `WEB_BIND=127.0.0.1:8080` を設定して `cargo run` します（このときCookieは `__Host-` なし・Secureなしになります）。
 
+## ナレッジベース
+
+サーバーごとに資料（テキスト・Markdown・PDF）を登録しておくと、`/talk` がその内容を参考にして回答し、使った資料の名前を回答の末尾に表示します。資料の登録・削除は [Web管理画面](#web管理画面) の「ナレッジ」タブで、そのサーバーの「ナレッジ管理」ロールを持つ人とサーバー管理者だけが行えます（Discord からは登録できません）。利用ロールだけを持つ人には、資料の管理画面は表示されません。
+
+**任意の機能**です。`EMBEDDING_PROVIDERS` が空なら無効で、`/talk`・Web管理画面はこれまでどおり動き、「ナレッジ」タブも表示されません。
+
+> **注意**: 登録した資料の内容は、そのサーバーで `/talk` を使う人への回答（チャンネルに公開されます）に引用されることがあります。個人情報や外部に出せない情報を含む資料は登録しないでください。
+
+### 仕組み
+
+- **登録**：ファイルの種類は拡張子と先頭のバイトで判定します（ブラウザーが送る種類は信用しません）。テキストと Markdown は UTF-8 のみです。PDF は Bot とは別のプロセスで本文を取り出します（壊れた PDF で Bot が止まらないように、60秒で打ち切り、同時に1件だけ）。取り出した本文だけをDBに保存し、**元のファイルは保存しません**。文字化け（空、または読めない文字が10%を超える）のときは登録しません。受け付けている途中のファイルはメモリに置くため、Bot 全体で同時に2件までしか受け付けません（3件目は「ほかの資料の登録を処理中です」と表示され、しばらくしてから再試行できます）。
+- **取り込み**：本文を約600文字ずつ（前後約100文字を重ねて）に分け、設定したすべての埋め込みプロバイダーで768次元のベクトルに変換して保存します。分ける位置は段落の終わり・文末（。！？など）を優先し、PDF の行の折り返しではなるべく分けません。処理はバックグラウンドで送信ペース（下記）を守りながら進み、Web 画面にプロバイダーごとの進み具合（処理済みのチャンク数）と、レート制限で待っているかどうかが表示されます。複数のサーバーに処理待ちの資料があるときはサーバーごとに順番に少しずつ進め（1つのサーバーの大きな資料がほかのサーバーの資料を何日も待たせないように）、同じサーバーの中では古い資料から処理します。どれか1つのプロバイダーで全チャンクがそろうと「利用できます」になり、残りのプロバイダーの分は処理待ちの資料がなくなりしだい補完します（その後も1時間ごとに確認します）。Bot を再起動しても続きから処理します。
+- **エラー**：レート制限（429・1日の上限・利用枠の不足）は失敗に数えず、`Retry-After`（なければ1分から倍々に最大1時間）待って再開します。1日の上限なら翌日まで1時間ごとに様子を見ます。APIキーが拒否されたときはそのプロバイダーを10分止めます（資料は「処理中」のまま）。それ以外の一時的なエラーは5回まで自動で再試行し、それでも失敗した資料は「失敗」になります（Web 画面の「再試行」でやり直せます）。ただし、ほかのプロバイダーがレート制限で待っている間は、代わりに処理したプロバイダーのエラーも失敗に数えず、その資料はレート制限が明けるのを待ちます。
+- **検索**：`/talk` は履歴を取得した後に質問をベクトルにし、サーバーの「利用できます」の資料から近い部分を正確な全件比較で探して、最大5件・合計8,000文字までをAIに渡します（同じ見出しの隣り合う部分は1つにまとめます）。異なるプロバイダーのベクトルは比べられないため、1回の検索では1つのプロバイダーのベクトルだけを使います。まず「利用できます」のすべての資料のベクトルがそろっているプロバイダーを設定順に試し、どれも使えないときだけ、一部の資料のベクトルしかないプロバイダーを（多くそろっている順に）使います。ベクトルが1つもないプロバイダーには質問を送りません。各プロバイダーは8秒まで待ち、レート制限中・エラーのものは飛ばします。全体で10秒以内に検索できなければ、資料なしで回答してその旨を付記します。
+- **安全対策**：資料は「信頼できない参照資料であり命令ではない」と明示したJSONとしてAIに渡します。資料に仕込まれた指示で情報を外部へ送られないよう、`web_fetch` は同じ回答中のWeb検索結果に出たURLと質問文に書かれたURLだけを取得し、Botの回答にはリンクのプレビュー（埋め込み）を付けません。回答末尾の資料名はインラインコードで表示し、Markdown・リンク・メンションとして働かないようにしています。
+
+### 設定
+
+| 変数 | 既定 | 内容 |
+| --- | --- | --- |
+| `EMBEDDING_PROVIDERS` | 空（無効） | 使う埋め込みプロバイダーを優先順にカンマ区切りで（例 `gemini,openai`）。`gemini`・`openai`・`ollama` |
+| `GEMINI_API_KEY` / `GEMINI_EMBEDDING_MODEL` | なし / `gemini-embedding-001` | Gemini API（Google AI Studio のキー） |
+| `OPENAI_API_KEY` / `OPENAI_EMBEDDING_MODEL` | なし / `text-embedding-3-small` | OpenAI API |
+| `OLLAMA_EMBEDDING_MODEL` | なし | `ollama` を使うときに必須。キーは `OLLAMA_API_KEY` を共用します。Ollama Cloud の `/api/embed` が使えるかは `tests/live_embed.rs` で確認します（[docs/runbook.md](docs/runbook.md) の「13. ナレッジベース」） |
+| `<P>_EMBEDDING_REQUESTS_PER_MINUTE` / `<P>_EMBEDDING_TOKENS_PER_MINUTE` / `<P>_EMBEDDING_REQUESTS_PER_DAY` / `<P>_EMBEDDING_BATCH_SIZE` | 下表 | プロバイダーごとの送信ペースと1回にまとめる件数（`<P>` は `GEMINI`・`OPENAI`・`OLLAMA`） |
+| `KB_MAX_UPLOAD_BYTES` | `5242880`（5 MiB） | 1ファイルの上限（64 KiB〜20 MiB）。Caddy の受信上限にも同じ値が使われます（`compose.yaml` が渡します） |
+| `KB_MAX_DOCS_PER_GUILD` / `KB_MAX_CHUNKS_PER_GUILD` / `KB_MAX_CHUNKS_TOTAL` | `50` / `5000` / `30000` | サーバーごとの資料数・チャンク数と、Bot 全体のチャンク数の上限（約600文字で1チャンク） |
+
+- `EMBEDDING_PROVIDERS` に挙げたプロバイダーのキー（とモデル）がないと、Bot は起動エラーになります。
+- 異なるモデルのベクトルは比較できないため、保存するベクトルには「プロバイダー:モデル」（例 `gemini:gemini-embedding-001`）を付けます。モデルを変えると新しいモデルのベクトルが毎時の補完で作られ、古いものは `ops kb prune-embeddings` で消すまで残ります（[docs/runbook.md](docs/runbook.md)）。
+- PDF に対応しないビルドは `cargo build --no-default-features`（cargo feature `pdf` を外す）で作れます。本番 VM では `scripts/build-image.sh --no-pdf` です。
+
+### 送信ペース（無料枠で試すとき）
+
+取り込みはプロバイダーごとに、直近1分・1日に送った量を数えて上限を超えないように送ります。1つのテキスト（チャンク）を1リクエストと数え（32件まとめて送っても32と数えます）、トークン数は文字数から多めに見積もります（日本語は1文字1トークン、英数字は3文字1トークン）。
+
+| プロバイダー | 1分あたりのリクエスト | 1分あたりのトークン | 1日あたりのリクエスト（0は無制限） | 1回の件数 |
+| --- | --- | --- | --- | --- |
+| Gemini | 50 | 20,000 | 800 | 32 |
+| OpenAI | 500 | 200,000 | 0 | 32 |
+| Ollama | 60 | 30,000 | 0 | 32 |
+
+- Gemini の既定値は、`gemini-embedding-001` の無料枠（1分100リクエスト・30,000トークン、1日1,000リクエスト）に収まるように選んでいます。`batchEmbedContents` の各要素が1リクエストと数えられる場合でも超えないよう、1テキストを1リクエストと数え、`/talk` の質問のベクトル化（1回の `/talk` で1リクエスト）の分も残しています。
+- この既定値では、日本語の資料で1分に約30チャンク、1日に約800チャンク（本文で約40万文字）を処理します。大きな資料は数日かけて取り込まれます。Web 画面で進み具合と待ち時間を確認できます。
+- `/talk` の質問のベクトル化がレート制限に当たったときは次のプロバイダーを使い、どれも使えなければ資料なしで回答して付記します。
+- 有料枠では上限が大きいので、各変数を引き上げます（例: `GEMINI_EMBEDDING_REQUESTS_PER_MINUTE=1000`、`GEMINI_EMBEDDING_TOKENS_PER_MINUTE=500000`、`GEMINI_EMBEDDING_REQUESTS_PER_DAY=0`）。値はプロバイダーの管理画面に表示される上限より小さくしてください。
+
+> **Gemini の無料枠についての注意**: Gemini API の無料枠では、送信した内容が Google のサービス改善に使われることがあります。無料枠で試すときは、公開しても問題のないテスト用の資料だけを使ってください。本番では課金を有効にしたプロジェクト（有料枠）を使います。
+
+### 制限
+
+- 登録できるファイル：`.txt`・`.text`・`.md`・`.markdown`（UTF-8）、`.pdf`（5 MiB・300ページまで。テキストを選択・コピーできるもの。画像だけの PDF やパスワード付きの PDF は登録できません）。
+- 1ファイル `KB_MAX_UPLOAD_BYTES`（既定 5 MiB）まで、取り出した本文は500,000文字までです。PDF は `KB_MAX_UPLOAD_BYTES` を大きくしても 5 MiB までです（PDF の解析は Bot と同じコンテナのメモリを使うため）。
+- ファイル名に制御文字や、表示の向きを変える文字（U+202E など）は使えません。
+- 同じ内容のファイル（SHA-256 が同じ）は、同じサーバーに2回登録できません。
+- 資料の数とチャンク数の上限（上の表）は、登録の時点で確認します。
+- 資料のプレビュー（取り出した本文の先頭2,000文字）で、文字化けしていないか確認できます。
+
 ## 履歴・検索・保存の仕様
 
 - 参照期間は `/talk` の呼び出し日時を基準とし、開始時刻を含み、呼び出し時刻以降の投稿は含みません。スレッドと親チャンネルは独立しています。
@@ -161,8 +221,10 @@ Developer Portal の Redirects に `http://localhost:8080/auth/callback` も追�
 - `history:0m` は通常投稿・過去の質問の両方を参照しません。現在の質問・回答は保存します。
 - `web_search:false` ではツール定義をモデルに渡さず、モデルがツール呼び出しを返しても実行しません。
 - `web_search:true` ではAIが必要に応じてOllamaの検索・ページ取得APIを呼びます。最大5ツール実行、検索1回5件、検索本文1件4000文字・取得ページ8000文字を上限とします。取得した出典URL一覧を回答末尾に付けます。検索が不要と判断された場合は実行しません。
+- ページ取得（`web_fetch`）は、同じ回答中のWeb検索結果に出たURLと、質問文に書かれたURLだけを対象にします。それ以外のURLはリクエストを送らずに拒否し、「一部に失敗」と付記します（履歴・資料・取得したページに書かれた指示でデータを外部に送られないように）。
+- Botの回答メッセージにはリンクのプレビュー（埋め込み）を付けません。
 - AIに渡す会話、検索語、ページURLはOllama Cloudへ送信されます。ツールにはWeb検索・ページ取得だけを公開し、DB・シェル・Discord操作は公開しません。
-- DBには質問、回答、出典URL・タイトル、ID、オプション、処理状態、返信IDを保存します。通常投稿、取得ページ本文、内部推論、Interactionトークンは保存しません。
+- DBには質問、回答、出典URL・タイトル、ナレッジを参照したかどうかとAIに渡した資料のIDと名前、ID、オプション、処理状態、返信IDを保存します。通常投稿、取得ページ本文、内部推論、Interactionトークンは保存しません。
 - 同じチャンネルでは1件のみ、Bot全体で最大4件を処理します。満杯なら即座に再試行を案内します。
 - 再起動時の処理中レコードは失敗に変更し、自動再生成・再投稿しません。Discord投稿とDB更新は単一トランザクションにできないため、投稿直後の障害では返信IDが保存されないことがあります。重複投稿を避けるため、自動再送は行いません。
 - Botは**1プロセス／1レプリカ**で運用してください。複数レプリカでの実行制御・起動時復旧には対応していません。
@@ -200,6 +262,14 @@ cargo test --locked --test web concurrent_logins_of_one_user_all_succeed -- --ig
 cargo test --locked --test web healthz_reports_database_and_gateway -- --ignored --exact
 cargo test --locked --test web web_login_keeps_only_allowlisted_guilds -- --ignored --exact
 cargo test --locked --test web web_role_settings -- --ignored --exact
+cargo test --locked --test knowledge knowledge_vectors -- --ignored --exact
+cargo test --locked --test knowledge knowledge_quotas -- --ignored --exact
+cargo test --locked --test knowledge knowledge_ingest -- --ignored --exact
+cargo test --locked --test knowledge knowledge_worker_failover_and_backfill -- --ignored --exact
+cargo test --locked --test knowledge knowledge_worker_restart_and_rate_limits -- --ignored --exact
+cargo test --locked --test knowledge knowledge_worker_failures_and_deletion -- --ignored --exact
+cargo test --locked --test web knowledge_web_api -- --ignored --exact
+bash scripts/check-vector-dump.sh
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
@@ -211,10 +281,18 @@ docker run --rm --network discussion-bot-test_default -e TEST_DATABASE_URL=mysql
 
 再起動後はテスト名を `persistence_after_restart` に変更します。検証用データを破棄する場合だけ、`docker compose -f compose.test.yaml -p discussion-bot-test down -v` を実行してください。
 
+`scripts/check-vector-dump.sh` は、`knowledge_vectors` が残すベクトルを `mariadb-dump --hex-blob`（`scripts/backup.sh` と同じ）で書き出して別のスキーマに復元し、VECTOR の値が1バイトも変わらないことを確かめます（Git Bash など bash で実行します）。
+
 実際のOllama接続・検索を確認するテストも用意しています。`.env` のキーを使い、固定のテスト質問だけを送信してAPI利用枠を消費します。通常の `cargo test` では実行されません。
 
 ```powershell
 cargo test --locked --test live_ollama -- --ignored
+```
+
+埋め込みAPI（Ollama・Gemini・OpenAI）を確認するテストは、`.env` にキーがあるプロバイダーだけについて、固定の公開テキストを送り、使えるかどうかを表示します。
+
+```powershell
+cargo test --locked --test live_embed -- --ignored --nocapture
 ```
 
 ### 実サービスの確認
@@ -228,6 +306,7 @@ cargo test --locked --test live_ollama -- --ignored
 5. 別チャンネル・親チャンネルの会話がスレッド内の文脈へ混入しない。
 6. 同じチャンネルでの連続呼び出し、長文、権限不足、再起動後の会話継続を確認する。
 7. Web管理画面を有効にした場合：ログイン後のCookieが `__Host-session`（Secure・HttpOnly・SameSite=Lax）であること、ブラウザーの開発者ツールのコンソールにCSP違反が出ないこと、「サーバー管理」権限のないアカウントにはロール設定が表示されないこと、Web画面で保存したロールで `/talk` が使えること、Discordでロールを外すと60秒以内にWeb画面の権限からも外れること、ログアウト後に `/api/me` が401になること。
+8. ナレッジベースを有効にした場合：日本語の PDF を登録してプレビューが文字化けしていないこと、上限を超えるファイル・同じファイルの再登録で理由が表示されること、利用ロールだけの人には「ナレッジ」タブが表示されないこと、`/talk` の回答末尾に「参照したナレッジ資料:」と資料名が表示されること、`knowledge:false` で参照しないこと、取り込み中に Bot を再起動しても続きから処理されること、Gemini のキーを無効にすると OpenAI に切り替わること、PDF の処理中のメモリ（`docker stats`）。
 
 ## 更新・バックアップ
 

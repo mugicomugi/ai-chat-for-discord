@@ -6,6 +6,7 @@ pub mod db;
 pub mod discord;
 pub mod history;
 pub mod ids;
+pub mod knowledge;
 pub mod limits;
 pub mod ops;
 pub mod output;

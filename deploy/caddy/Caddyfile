@@ -10,9 +10,11 @@
 }
 
 {$DOMAIN} {
-	# Above the knowledge upload limit (5 MiB, M3); the bot enforces its own limits as well.
+	# The knowledge upload limit (compose.yaml passes KB_MAX_UPLOAD_BYTES, default 5 MiB); the
+	# bot applies the same limit to the upload route and 16 KiB to everything else. A file is
+	# sent as the raw request body, so the two limits agree byte for byte.
 	request_body {
-		max_size 6MB
+		max_size {$KB_MAX_UPLOAD_BYTES:5242880}
 	}
 	header {
 		Strict-Transport-Security "max-age=31536000"

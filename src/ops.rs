@@ -27,7 +27,11 @@ pub const USAGE: &str = "usage:
   ops guild role list <GUILD_ID>
   ops guild role add <GUILD_ID> <use|manage> <ROLE_ID>
   ops guild role remove <GUILD_ID> <use|manage> <ROLE_ID>
+  ops kb prune-embeddings [--apply]
 (a ROLE_ID equal to the GUILD_ID is @everyone)";
+
+/// Vectors deleted per statement by `kb prune-embeddings`.
+const PRUNE_BATCH: u32 = 5_000;
 
 pub async fn run(args: &[String]) -> Result<()> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -39,6 +43,8 @@ pub async fn run(args: &[String]) -> Result<()> {
             | ["guild", "deny", _]
             | ["guild", "role", "list", _]
             | ["guild", "role", "add" | "remove", _, _, _]
+            | ["kb", "prune-embeddings"]
+            | ["kb", "prune-embeddings", "--apply"]
     ) {
         bail!("{USAGE}");
     }
@@ -48,6 +54,16 @@ pub async fn run(args: &[String]) -> Result<()> {
     })?;
     let http = Http::new(&config.discord_token);
     match args.as_slice() {
+        ["kb", "prune-embeddings", rest @ ..] => {
+            let current: Vec<String> = config
+                .kb
+                .iter()
+                .flat_map(|kb| kb.providers.iter().map(|provider| provider.key()))
+                .collect();
+            prune_embeddings(&db, &current, rest == ["--apply"], PRUNE_BATCH)
+                .await
+                .map(|_| ())
+        }
         ["guild", "list"] => list_guilds(&db, &http).await,
         ["guild", "allow", guild, note @ ..] => {
             let guild = snowflake(guild, "GUILD_ID")?;
@@ -151,6 +167,73 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
         _ => bail!("{USAGE}"),
     }
+}
+
+/// Deletes vectors whose provider key (provider and model) is not in `current`, for example
+/// after changing a model, `batch` rows per statement. A dry run unless `apply`. Never runs
+/// with no provider configured: a configuration mistake must not wipe every vector. Returns
+/// how many vectors were deleted.
+pub async fn prune_embeddings(
+    db: &Database,
+    current: &[String],
+    apply: bool,
+    batch: u32,
+) -> Result<u64> {
+    let counts = db
+        .kb_vector_counts()
+        .await
+        .context("reading the stored vectors failed")?;
+    println!("PROVIDER_KEY                                                      VECTORS  STATUS");
+    for (key, count) in &counts {
+        let status = if current.contains(key) {
+            "current"
+        } else {
+            "stale"
+        };
+        println!("{key:<64}  {count:>7}  {status}");
+    }
+    if counts.is_empty() {
+        println!("(no vectors stored)");
+    }
+    let stale: Vec<&(String, u64)> = counts
+        .iter()
+        .filter(|(key, _)| !current.contains(key))
+        .collect();
+    if stale.is_empty() {
+        println!("nothing to prune");
+        return Ok(0);
+    }
+    if current.is_empty() {
+        bail!(
+            "EMBEDDING_PROVIDERS is empty, so every stored vector counts as stale; refusing. \
+             Configure the providers first."
+        );
+    }
+    let total: u64 = stale.iter().map(|(_, count)| count).sum();
+    if !apply {
+        println!(
+            "dry run: {total} vectors of {} stale provider key(s) would be deleted; run with --apply to delete them",
+            stale.len()
+        );
+        return Ok(0);
+    }
+    let mut total = 0;
+    for (key, _) in stale {
+        let mut deleted = 0;
+        loop {
+            let rows = db
+                .kb_delete_vectors(key, batch)
+                .await
+                .context("deleting vectors failed")?;
+            deleted += rows;
+            if rows < u64::from(batch) {
+                break;
+            }
+        }
+        println!("deleted {deleted} vectors of {key}");
+        total += deleted;
+    }
+    Ok(total)
 }
 
 async fn list_guilds(db: &Database, http: &Http) -> Result<()> {
@@ -276,6 +359,8 @@ mod tests {
             vec!["guild"],
             vec!["guild", "role", "add", "1", "use"],
             vec!["guild", "purge", "1"],
+            vec!["kb", "prune-embeddings", "--force"],
+            vec!["kb"],
         ] {
             let args: Vec<String> = args.into_iter().map(String::from).collect();
             let error = run(&args).await.unwrap_err().to_string();

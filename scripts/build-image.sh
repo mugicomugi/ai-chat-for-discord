@@ -4,8 +4,24 @@
 # binary. Prints the image reference to pass to scripts/deploy.sh.
 #
 #   scripts/build-image.sh          # as the normal user (docker commands use sudo)
+#   scripts/build-image.sh --no-pdf # without PDF support (cargo feature `pdf`), if the PDF
+#                                   # parser does not build on the VM (README "ナレッジベース")
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+features=()
+suffix=""
+case "${1:-}" in
+    "") ;;
+    --no-pdf)
+        features=(--no-default-features)
+        suffix="-nopdf"
+        ;;
+    *)
+        echo "usage: scripts/build-image.sh [--no-pdf]" >&2
+        exit 2
+        ;;
+esac
 
 # Everything compiled into the image must be committed (untracked source files included),
 # because the tag names the commit.
@@ -14,9 +30,9 @@ if [[ -n "$(git status --porcelain -- src migrations static docs/privacy.md docs
     echo "build-image.sh: commit or stash changes under src/, migrations/, static/, docs/privacy.md, docs/terms.md … first; the image tag names a commit" >&2
     exit 1
 fi
-tag="discord-discussion-bot:git-$(git rev-parse --short=12 HEAD)"
+tag="discord-discussion-bot:git-$(git rev-parse --short=12 HEAD)${suffix}"
 
-scripts/cargo-vm.sh build --locked --release
+scripts/cargo-vm.sh build --locked --release "${features[@]}"
 context=$(mktemp -d)
 trap 'rm -rf -- "$context"' EXIT
 cp target/release/discord-discussion-bot "$context/"

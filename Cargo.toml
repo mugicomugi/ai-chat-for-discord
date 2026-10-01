@@ -11,6 +11,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+# PDF text extraction (feature `pdf`), run in a child process; lopdf >= 0.42 (RUSTSEC-2026-0187).
+pdf-extract = { version = "0.12.1", optional = true }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # Randomness, SHA-256 and constant-time comparison; already built for rustls.
@@ -20,10 +22,15 @@ serde_json = "1"
 serenity = { version = "0.12.5", default-features = false, features = ["builder", "client", "gateway", "http", "model", "rustls_backend"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "mysql", "chrono", "migrate", "macros", "json"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+
+[features]
+default = ["pdf"]
+# PDF uploads for the knowledge base. Without it only .txt and .md are accepted.
+pdf = ["dep:pdf-extract"]
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -61,6 +61,15 @@ pub fn split_message(text: &str) -> Vec<String> {
     result
 }
 
+/// Bidirectional formatting characters (marks, embeddings, overrides, isolates). They reorder
+/// the text around them, so a name containing them can display as a different name.
+pub fn reorders_text(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 fn flush(result: &mut Vec<String>, current: &mut String, fence: &Option<(String, String)>) {
     if let Some((delimiter, opening)) = fence {
         current.push_str(&format!("\n{delimiter}"));

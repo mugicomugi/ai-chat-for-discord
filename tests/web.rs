@@ -24,8 +24,9 @@ use chrono::Utc;
 use discord_discussion_bot::{
     access::{Access, GuildAccess},
     agent::Agent,
-    config::WebConfig,
+    config::{KbConfig, ProviderConfig, ProviderKind, WebConfig},
     db::{Database, MAX_SESSIONS_PER_USER, SessionGuild},
+    knowledge::{Knowledge, UPLOAD_SLOTS},
     limits::Limits,
     web::{
         self, AppState, JsonBody, Shared, Web,
@@ -96,6 +97,7 @@ fn state(db: Database, discord: &str) -> AppState {
             bot_guilds: Default::default(),
             discord_ready: Arc::new(AtomicBool::new(true)),
             discord_cache: Default::default(),
+            knowledge: None,
         },
     )
     .unwrap()
@@ -1531,4 +1533,406 @@ async fn web_role_settings() {
     for user in [manager, member] {
         clear_user(&db, user).await;
     }
+}
+
+// ---- Knowledge base API ----
+
+/// The web state with a knowledge base whose provider is never called (no worker runs here).
+fn knowledge_state(db: Database, discord: &str, max_upload_bytes: usize) -> AppState {
+    let http = HttpBuilder::new("bot-token")
+        .proxy(discord)
+        .ratelimiter_disabled(true)
+        .build();
+    let knowledge = Knowledge::new(
+        KbConfig {
+            providers: vec![ProviderConfig::new(
+                ProviderKind::Gemini,
+                "web-test",
+                "unused",
+                "http://127.0.0.1:9",
+            )],
+            max_upload_bytes,
+            max_docs_per_guild: 50,
+            max_chunks_per_guild: 5_000,
+            max_chunks_total: 10_000_000,
+        },
+        db.clone(),
+    )
+    .unwrap();
+    Web::new(
+        config(discord),
+        Shared {
+            db,
+            agent: Agent::new("http://127.0.0.1:9", "unused".into(), "unused".into()).unwrap(),
+            limits: Arc::new(Limits::new(4)),
+            http: Arc::new(http),
+            bot_guilds: Default::default(),
+            discord_ready: Arc::new(AtomicBool::new(true)),
+            discord_cache: Default::default(),
+            knowledge: Some(Arc::new(knowledge)),
+        },
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn knowledge_writes_need_same_origin_and_a_session() {
+    let state = knowledge_state(offline_database(), "http://127.0.0.1:9", 65_536);
+    let documents = "/api/guilds/1/kb/documents";
+    for (method, uri) in [
+        ("POST", documents.to_owned()),
+        ("POST", format!("{documents}/1/retry")),
+        ("DELETE", format!("{documents}/1")),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(&uri)
+            .header("x-file-name", "a.txt")
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::from("text"))
+            .unwrap();
+        let (status, _, body) = send(&state, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        assert_eq!(json_body(&body)["error"], "cross_origin");
+    }
+    for request in [
+        get(documents),
+        Request::post(documents)
+            .header(header::ORIGIN, ORIGIN)
+            .header("x-file-name", "a.txt")
+            .body(Body::from("text"))
+            .unwrap(),
+    ] {
+        let (status, _, body) = send(&state, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(&body)["error"], "unauthenticated");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires compose.test.yaml and TEST_DATABASE_URL"]
+async fn knowledge_web_api() {
+    let db = database().await;
+    let (manager, member) = (971_001_u64, 971_002_u64);
+    let guild = 971_101_u64;
+    let (managers, members) = (971_201_u64, 971_202_u64);
+    for user in [manager, member] {
+        clear_user(&db, user).await;
+    }
+    clear_guilds(&db, &[guild]).await;
+    sqlx::query("DELETE FROM kb_documents WHERE guild_id=?")
+        .bind(guild)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.allow_guild(guild, None).await.unwrap();
+    use discord_discussion_bot::access::RoleKind;
+    db.add_guild_role(guild, RoleKind::Use, members, None)
+        .await
+        .unwrap();
+    db.add_guild_role(guild, RoleKind::Manage, managers, None)
+        .await
+        .unwrap();
+
+    let discord = MockServer::start().await;
+    // The manager is looked up again by the second state (knowledge base disabled).
+    mock_member(&discord, guild, manager, &[managers], 2).await;
+    mock_member(&discord, guild, member, &[members], 1).await;
+    let roles = [
+        role(managers, "資料係", 2, 0),
+        role(members, "メンバー", 1, 0),
+    ];
+    mock_guild(&discord, guild, 1, &roles, 2).await;
+    let limit = 65_536;
+    let state = knowledge_state(db.clone(), &discord.uri(), limit);
+    state.bot_guilds.write().unwrap().insert(guild);
+    let guilds = vec![SessionGuild {
+        id: guild,
+        name: "ナレッジ".into(),
+    }];
+    let mut cookies = Vec::new();
+    for user in [manager, member] {
+        let token = security::new_token();
+        db.create_session(
+            &security::hash(&token),
+            user,
+            "管理する人",
+            &guilds,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        cookies.push(format!("__Host-session={}", security::encode(&token)));
+    }
+    let (manager_cookie, member_cookie) = (cookies[0].clone(), cookies[1].clone());
+    let base = format!("/api/guilds/{guild}/kb/documents");
+    let read = |cookie: &str, uri: &str| {
+        Request::get(uri)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let write = |method: &str, cookie: &str, uri: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::COOKIE, cookie)
+            .header(header::ORIGIN, ORIGIN)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let upload = |cookie: &str, name: Option<&str>, body: Vec<u8>| {
+        let mut request = Request::post(&base)
+            .header(header::COOKIE, cookie)
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(name) = name {
+            request = request.header("x-file-name", name);
+        }
+        request.body(Body::from(body)).unwrap()
+    };
+
+    let (status, _, body) = send(&state, read(&manager_cookie, "/api/me")).await;
+    assert_eq!(status, StatusCode::OK);
+    let me = json_body(&body);
+    assert_eq!(me["knowledge"], true);
+    assert_eq!(
+        me["guilds"][0]["access"],
+        json!({"use": false, "manage_kb": true, "configure": false})
+    );
+
+    // Members who may only use the bot get nothing of the knowledge base.
+    let (status, _, _) = send(&state, read(&member_cookie, &base)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let request = upload(&member_cookie, Some("a.txt"), b"text".to_vec());
+    assert_eq!(send(&state, request).await.0, StatusCode::FORBIDDEN);
+
+    // Refused uploads.
+    let text = "社内手順の資料です。".repeat(30);
+    let mut too_large = Request::post(&base)
+        .header(header::COOKIE, &manager_cookie)
+        .header(header::ORIGIN, ORIGIN)
+        .header("x-file-name", "big.txt")
+        .header(header::CONTENT_LENGTH, limit + 1)
+        .body(Body::from(vec![b'a'; limit + 1]))
+        .unwrap();
+    let (status, _, body) = send(&state, too_large).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(json_body(&body)["error"], "payload_too_large");
+    assert!(
+        json_body(&body)["message"]
+            .as_str()
+            .unwrap()
+            .contains("ファイルは")
+    );
+    // Without Content-Length the body limit of the route stops the read.
+    too_large = upload(&manager_cookie, Some("big.txt"), vec![b'a'; limit + 1]);
+    assert_eq!(
+        send(&state, too_large).await.0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    for (name, body, expected_status, code) in [
+        (
+            None,
+            text.clone().into_bytes(),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            Some("a.docx"),
+            b"PK".to_vec(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_type",
+        ),
+        (
+            Some("fake.pdf"),
+            b"text".to_vec(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "type_mismatch",
+        ),
+        (
+            Some("sjis.txt"),
+            vec![0x93, 0xfa],
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "not_utf8",
+        ),
+        (
+            Some("empty.txt"),
+            Vec::new(),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+    ] {
+        let (status, _, response) = send(&state, upload(&manager_cookie, name, body)).await;
+        assert_eq!(status, expected_status, "{name:?}");
+        assert_eq!(json_body(&response)["error"], code, "{name:?}");
+    }
+    assert_eq!(db.kb_usage(guild).await.unwrap().documents, 0);
+
+    // メモ.txt, percent-encoded.
+    let (status, _, body) = send(
+        &state,
+        upload(
+            &manager_cookie,
+            Some("%E3%83%A1%E3%83%A2.txt"),
+            text.clone().into_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let document = json_body(&body);
+    let id = document["id"].as_u64().unwrap();
+    assert_eq!(document["title"], "メモ");
+    assert_eq!(document["file_name"], "メモ.txt");
+    assert_eq!(document["kind"], "text");
+    assert_eq!(document["status"], "processing");
+    assert_eq!(document["uploaded_by"], "管理する人");
+    assert_eq!(
+        document["progress"],
+        json!([{"provider": "Gemini (web-test)", "embedded": 0}])
+    );
+    // Larger than the JSON API's 16 KiB: the upload route's own limit applies.
+    let larger = "大きめの資料です。".repeat(2_000);
+    assert!(larger.len() > 16 * 1024 && larger.len() < limit);
+    let (status, _, body) = send(
+        &state,
+        upload(&manager_cookie, Some("larger.txt"), larger.into_bytes()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{:?}", json_body(&body));
+    let larger_id = json_body(&body)["id"].as_u64().unwrap();
+    let request = write("DELETE", &manager_cookie, &format!("{base}/{larger_id}"));
+    assert_eq!(send(&state, request).await.0, StatusCode::NO_CONTENT);
+    let (status, _, body) = send(
+        &state,
+        upload(&manager_cookie, Some("copy.txt"), text.clone().into_bytes()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json_body(&body)["error"], "duplicate");
+    assert!(
+        json_body(&body)["message"]
+            .as_str()
+            .unwrap()
+            .contains("メモ")
+    );
+    // While every upload slot is taken (files being received or extracted), further uploads
+    // are turned away before their body is read.
+    let knowledge = state.knowledge.clone().unwrap();
+    let held: Vec<_> = (0..UPLOAD_SLOTS)
+        .map(|_| knowledge.upload_slot().unwrap())
+        .collect();
+    let (status, _, body) = send(
+        &state,
+        upload(&manager_cookie, Some("busy.txt"), b"busy".to_vec()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json_body(&body)["error"], "upload_busy");
+    drop(held);
+    // A slot is given back however the upload ends.
+    let (status, _, _) = send(
+        &state,
+        upload(&manager_cookie, Some("copy.txt"), text.clone().into_bytes()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(knowledge.upload_slot().is_some());
+
+    let (status, _, body) = send(&state, read(&manager_cookie, &base)).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = json_body(&body);
+    assert_eq!(list["documents"].as_array().unwrap().len(), 1);
+    assert_eq!(list["documents"][0]["id"], id);
+    assert_eq!(list["usage"]["documents"], 1);
+    assert_eq!(list["usage"]["max_documents"], 50);
+    assert_eq!(list["limits"]["max_upload_bytes"], limit);
+    let mut extensions = vec![".txt", ".text", ".md", ".markdown"];
+    if cfg!(feature = "pdf") {
+        extensions.push(".pdf");
+    }
+    assert_eq!(list["limits"]["extensions"], json!(extensions));
+    assert_eq!(list["limits"]["max_pdf_bytes"], limit);
+    assert_eq!(list["limits"]["max_pdf_pages"], 300);
+    assert_eq!(list["providers"][0]["key"], "gemini:web-test");
+    assert_eq!(list["providers"][0]["state"], "ok");
+
+    let (status, _, body) = send(
+        &state,
+        read(&manager_cookie, &format!("{base}/{id}/preview")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let preview = json_body(&body);
+    assert_eq!(preview["text"], text);
+    assert_eq!(preview["truncated"], false);
+
+    // Only failed documents can be retried.
+    let (status, _, body) = send(
+        &state,
+        write("POST", &manager_cookie, &format!("{base}/{id}/retry")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json_body(&body)["error"], "not_failed");
+    sqlx::query("UPDATE kb_documents SET status='failed',attempts=5,error_code='embedding_upstream' WHERE id=?")
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (_, _, body) = send(&state, read(&manager_cookie, &base)).await;
+    let failed = &json_body(&body)["documents"][0];
+    assert_eq!(failed["status"], "failed");
+    assert!(failed["error"].as_str().unwrap().contains("再試行"));
+    let (status, _, body) = send(
+        &state,
+        write("POST", &manager_cookie, &format!("{base}/{id}/retry")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&body)["status"], "processing");
+    assert_eq!(json_body(&body)["attempts"], 0);
+
+    // Deleting.
+    let request = Request::delete(format!("{base}/{id}"))
+        .header(header::COOKIE, &manager_cookie)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&state, request).await.0, StatusCode::FORBIDDEN);
+    let request = write("DELETE", &member_cookie, &format!("{base}/{id}"));
+    assert_eq!(send(&state, request).await.0, StatusCode::FORBIDDEN);
+    let request = write("DELETE", &manager_cookie, &format!("{base}/{id}"));
+    assert_eq!(send(&state, request).await.0, StatusCode::NO_CONTENT);
+    for request in [
+        write("DELETE", &manager_cookie, &format!("{base}/{id}")),
+        read(&manager_cookie, &format!("{base}/{id}/preview")),
+        write("POST", &manager_cookie, &format!("{base}/{id}/retry")),
+        read(&manager_cookie, &format!("{base}/abc/preview")),
+    ] {
+        assert_eq!(send(&state, request).await.0, StatusCode::NOT_FOUND);
+    }
+
+    // The upload route's larger limit does not apply to the JSON API.
+    let big = json!({"use": vec!["1"; 5_000], "manage": []});
+    let request = Request::put(format!("/api/guilds/{guild}/config/roles"))
+        .header(header::COOKIE, &manager_cookie)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(big.to_string()))
+        .unwrap();
+    assert_eq!(send(&state, request).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // With the knowledge base disabled its API is 404 and /api/me does not offer it.
+    let disabled = self::state(db.clone(), &discord.uri());
+    disabled.bot_guilds.write().unwrap().insert(guild);
+    assert_eq!(
+        send(&disabled, read(&manager_cookie, &base)).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (_, _, body) = send(&disabled, read(&manager_cookie, "/api/me")).await;
+    assert!(json_body(&body).get("knowledge").is_none());
+    for user in [manager, member] {
+        clear_user(&db, user).await;
+    }
+    clear_guilds(&db, &[guild]).await;
 }

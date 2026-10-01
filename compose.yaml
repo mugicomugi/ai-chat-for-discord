@@ -31,6 +31,31 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       # Caddy proxies to bot:8080; the port is not published on the host.
       WEB_BIND: 0.0.0.0:8080
+      # Knowledge base (README, docs/runbook.md section 13): off while EMBEDDING_PROVIDERS is
+      # empty. Empty values mean the defaults.
+      EMBEDDING_PROVIDERS: ${EMBEDDING_PROVIDERS:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_EMBEDDING_MODEL: ${GEMINI_EMBEDDING_MODEL:-}
+      GEMINI_EMBEDDING_REQUESTS_PER_MINUTE: ${GEMINI_EMBEDDING_REQUESTS_PER_MINUTE:-}
+      GEMINI_EMBEDDING_TOKENS_PER_MINUTE: ${GEMINI_EMBEDDING_TOKENS_PER_MINUTE:-}
+      GEMINI_EMBEDDING_REQUESTS_PER_DAY: ${GEMINI_EMBEDDING_REQUESTS_PER_DAY:-}
+      GEMINI_EMBEDDING_BATCH_SIZE: ${GEMINI_EMBEDDING_BATCH_SIZE:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-}
+      OPENAI_EMBEDDING_REQUESTS_PER_MINUTE: ${OPENAI_EMBEDDING_REQUESTS_PER_MINUTE:-}
+      OPENAI_EMBEDDING_TOKENS_PER_MINUTE: ${OPENAI_EMBEDDING_TOKENS_PER_MINUTE:-}
+      OPENAI_EMBEDDING_REQUESTS_PER_DAY: ${OPENAI_EMBEDDING_REQUESTS_PER_DAY:-}
+      OPENAI_EMBEDDING_BATCH_SIZE: ${OPENAI_EMBEDDING_BATCH_SIZE:-}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-}
+      OLLAMA_EMBEDDING_REQUESTS_PER_MINUTE: ${OLLAMA_EMBEDDING_REQUESTS_PER_MINUTE:-}
+      OLLAMA_EMBEDDING_TOKENS_PER_MINUTE: ${OLLAMA_EMBEDDING_TOKENS_PER_MINUTE:-}
+      OLLAMA_EMBEDDING_REQUESTS_PER_DAY: ${OLLAMA_EMBEDDING_REQUESTS_PER_DAY:-}
+      OLLAMA_EMBEDDING_BATCH_SIZE: ${OLLAMA_EMBEDDING_BATCH_SIZE:-}
+      # Caddy gets the same upload limit (service caddy below).
+      KB_MAX_UPLOAD_BYTES: ${KB_MAX_UPLOAD_BYTES:-}
+      KB_MAX_DOCS_PER_GUILD: ${KB_MAX_DOCS_PER_GUILD:-}
+      KB_MAX_CHUNKS_PER_GUILD: ${KB_MAX_CHUNKS_PER_GUILD:-}
+      KB_MAX_CHUNKS_TOTAL: ${KB_MAX_CHUNKS_TOTAL:-}
     # The health check (`/app/bot healthcheck`) is part of the image (Dockerfile), so images
     # older than M2 run without one after a rollback. Do not add `healthcheck:` here.
     depends_on:
@@ -109,6 +134,8 @@ services:
       - "443:443"
     environment:
       DOMAIN: ${DOMAIN:-}
+      # Request body limit, equal to the bot's knowledge upload limit (default 5 MiB).
+      KB_MAX_UPLOAD_BYTES: ${KB_MAX_UPLOAD_BYTES:-5242880}
     volumes:
       - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

@@ -1,10 +1,12 @@
-//! The web UI: Discord login, the server list and role settings. It runs in the bot's process
-//! and shares its database pool, Discord REST client (and rate limits) and generation limits.
+//! The web UI: Discord login, the server list, role settings and the knowledge base. It runs in
+//! the bot's process and shares its database pool, Discord REST client (and rate limits),
+//! generation limits and knowledge base.
 
 pub mod admin;
 pub mod assets;
 pub mod auth;
 pub mod authz;
+pub mod kb;
 pub mod security;
 
 use std::{
@@ -24,13 +26,13 @@ use axum::{
     http::{StatusCode, Uri, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use serde::de::DeserializeOwned;
 use serenity::http::Http;
 use tokio::{net::TcpListener, sync::watch};
 
-use crate::{agent::Agent, config::WebConfig, db::Database, limits::Limits};
+use crate::{agent::Agent, config::WebConfig, db::Database, knowledge::Knowledge, limits::Limits};
 
 /// Guilds the bot is currently in, kept from gateway events (serenity's cache is disabled).
 pub type BotGuilds = Arc<RwLock<HashSet<u64>>>;
@@ -54,6 +56,8 @@ pub struct Shared {
     /// `discord::watch_gateway`.
     pub discord_ready: Arc<AtomicBool>,
     pub discord_cache: Arc<authz::DiscordCache>,
+    /// `None` when the knowledge base is disabled.
+    pub knowledge: Option<Arc<Knowledge>>,
 }
 
 pub struct Web {
@@ -69,6 +73,8 @@ pub struct Web {
     pub oauth: auth::OAuthClient,
     pub cookies: security::Cookies,
     pub pages: assets::Pages,
+    /// `None` when the knowledge base is disabled; its pages then answer 404.
+    pub knowledge: Option<Arc<Knowledge>>,
 }
 
 pub type AppState = Arc<Web>;
@@ -76,6 +82,7 @@ pub type AppState = Arc<Web>;
 impl Web {
     pub fn new(config: WebConfig, shared: Shared) -> Result<AppState, reqwest::Error> {
         Ok(Arc::new(Self {
+            knowledge: shared.knowledge,
             oauth: auth::OAuthClient::new(&config)?,
             cookies: security::Cookies::new(config.secure()),
             authz: authz::Authz::new(shared.http, shared.discord_cache),
@@ -98,6 +105,14 @@ impl Web {
 }
 
 pub fn router(state: AppState) -> Router {
+    // The upload route takes a whole file as its body; every other route small JSON documents.
+    // Caddy's request_body limit uses the same KB_MAX_UPLOAD_BYTES (deploy/caddy/Caddyfile).
+    let upload_limit = state
+        .knowledge
+        .as_ref()
+        .map_or(MAX_BODY_BYTES, |knowledge| {
+            knowledge.config.max_upload_bytes
+        });
     Router::new()
         .route("/", get(assets::index))
         .route("/static/{*path}", get(assets::file))
@@ -110,6 +125,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/me", get(admin::me))
         .route("/api/guilds/{guild}/roles", get(admin::roles))
         .route("/api/guilds/{guild}/config/roles", put(admin::put_roles))
+        .route(
+            "/api/guilds/{guild}/kb/documents",
+            get(kb::list)
+                .post(kb::upload)
+                .layer(DefaultBodyLimit::max(upload_limit)),
+        )
+        .route("/api/guilds/{guild}/kb/documents/{id}", delete(kb::remove))
+        .route(
+            "/api/guilds/{guild}/kb/documents/{id}/preview",
+            get(kb::preview),
+        )
+        .route(
+            "/api/guilds/{guild}/kb/documents/{id}/retry",
+            post(kb::retry),
+        )
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
@@ -181,6 +211,13 @@ pub enum ApiError {
     Database,
     #[error("internal")]
     Internal,
+    /// Refusals with their own status, kind code and message (the knowledge base API).
+    #[error("{code}")]
+    Refused {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl ApiError {
@@ -194,6 +231,7 @@ impl ApiError {
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
             Self::DiscordUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Database | Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Refused { status, .. } => *status,
         }
     }
 
@@ -211,6 +249,7 @@ impl ApiError {
             }
             Self::Database => DATABASE_UNAVAILABLE,
             Self::Internal => INTERNAL_ERROR,
+            Self::Refused { message, .. } => message,
         }
     }
 }
